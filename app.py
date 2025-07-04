@@ -12,73 +12,104 @@ import re
 from pathlib import Path
 import tempfile
 import shutil
+import logging
+import sys
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('streaming_app.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Database setup
 def init_database():
     """Initialize SQLite database with required tables"""
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
-    # Stream configurations table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS stream_configs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            stream_key TEXT NOT NULL,
-            video_file TEXT NOT NULL,
-            resolution TEXT NOT NULL,
-            bitrate INTEGER NOT NULL,
-            shorts_mode BOOLEAN DEFAULT FALSE,
-            audio_bitrate INTEGER DEFAULT 128,
-            encoding_preset TEXT DEFAULT 'medium',
-            auto_restart BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Stream history table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS stream_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            config_name TEXT,
-            video_file TEXT NOT NULL,
-            resolution TEXT NOT NULL,
-            bitrate INTEGER NOT NULL,
-            duration INTEGER,
-            status TEXT NOT NULL,
-            start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            end_time TIMESTAMP,
-            error_message TEXT
-        )
-    ''')
-    
-    # App settings table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Video merge history table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS merge_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            output_file TEXT NOT NULL,
-            input_files TEXT NOT NULL,
-            merge_method TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            duration REAL,
-            file_size INTEGER,
-            error_message TEXT
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        
+        # Stream configurations table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stream_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                stream_key TEXT NOT NULL,
+                video_file TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                bitrate INTEGER NOT NULL,
+                shorts_mode BOOLEAN DEFAULT FALSE,
+                audio_bitrate INTEGER DEFAULT 128,
+                encoding_preset TEXT DEFAULT 'medium',
+                auto_restart BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Stream history table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stream_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_name TEXT,
+                video_file TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                bitrate INTEGER NOT NULL,
+                duration INTEGER,
+                status TEXT NOT NULL,
+                start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                end_time TIMESTAMP,
+                error_message TEXT
+            )
+        ''')
+        
+        # App settings table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Merge history table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS merge_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                output_file TEXT NOT NULL,
+                input_files TEXT NOT NULL,
+                merge_method TEXT NOT NULL,
+                duration REAL,
+                file_size INTEGER,
+                status TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                error_message TEXT
+            )
+        ''')
+        
+        # Streaming logs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS streaming_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                log_level TEXT NOT NULL,
+                message TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        logger.info("Database initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"Error initializing database: {str(e)}")
+        st.error(f"Database initialization error: {str(e)}")
+    finally:
+        conn.close()
 
 # Initialize database
 init_database()
@@ -94,21 +125,67 @@ if 'log_queue' not in st.session_state:
     st.session_state.log_queue = queue.Queue()
 if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = []
-if 'merge_process' not in st.session_state:
-    st.session_state.merge_process = None
-if 'merge_active' not in st.session_state:
-    st.session_state.merge_active = False
+if 'stream_logs' not in st.session_state:
+    st.session_state.stream_logs = []
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = f"stream_{int(time.time())}"
+
+def log_to_database(session_id, level, message):
+    """Log message to database"""
+    try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO streaming_logs (session_id, log_level, message)
+            VALUES (?, ?, ?)
+        ''', (session_id, level, message))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error logging to database: {str(e)}")
+
+def add_stream_log(level, message):
+    """Add log message to session state and database"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {level}: {message}"
+    st.session_state.stream_logs.append(log_entry)
+    
+    # Keep only last 100 logs
+    if len(st.session_state.stream_logs) > 100:
+        st.session_state.stream_logs = st.session_state.stream_logs[-100:]
+    
+    # Log to database
+    log_to_database(st.session_state.session_id, level, message)
+    
+    # Log to file
+    if level == "ERROR":
+        logger.error(message)
+    elif level == "WARNING":
+        logger.warning(message)
+    else:
+        logger.info(message)
 
 def get_video_info(video_path):
     """Get video information using ffprobe"""
     try:
+        add_stream_log("INFO", f"Getting video info for: {video_path}")
+        
+        if not os.path.exists(video_path):
+            add_stream_log("ERROR", f"Video file does not exist: {video_path}")
+            return None
+        
         cmd = [
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
             '-show_format', '-show_streams', video_path
         ]
+        
+        add_stream_log("INFO", f"Running ffprobe command: {' '.join(cmd)}")
+        
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         
         if result.returncode != 0:
+            add_stream_log("ERROR", f"ffprobe failed with return code {result.returncode}")
+            add_stream_log("ERROR", f"ffprobe stderr: {result.stderr}")
             return None
             
         data = json.loads(result.stdout)
@@ -121,6 +198,7 @@ def get_video_info(video_path):
                 break
         
         if not video_stream:
+            add_stream_log("ERROR", "No video stream found in file")
             return None
         
         # Extract information with safe defaults
@@ -134,10 +212,17 @@ def get_video_info(video_path):
             'fps': eval(video_stream.get('r_frame_rate', '0/1')) if '/' in str(video_stream.get('r_frame_rate', '0/1')) else 0
         }
         
+        add_stream_log("INFO", f"Video info extracted successfully: {info}")
         return info
         
+    except subprocess.TimeoutExpired:
+        add_stream_log("ERROR", "ffprobe command timed out")
+        return None
+    except json.JSONDecodeError as e:
+        add_stream_log("ERROR", f"Failed to parse ffprobe JSON output: {str(e)}")
+        return None
     except Exception as e:
-        st.error(f"Error getting video info: {str(e)}")
+        add_stream_log("ERROR", f"Error getting video info: {str(e)}")
         return None
 
 def format_duration(seconds):
@@ -161,10 +246,10 @@ def format_file_size(bytes_size):
 
 def save_stream_config(name, config):
     """Save streaming configuration to database"""
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
     try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        
         cursor.execute('''
             INSERT OR REPLACE INTO stream_configs 
             (name, stream_key, video_file, resolution, bitrate, shorts_mode, 
@@ -177,19 +262,20 @@ def save_stream_config(name, config):
             config.get('auto_restart', False)
         ))
         conn.commit()
+        add_stream_log("INFO", f"Configuration '{name}' saved successfully")
         return True
     except Exception as e:
-        st.error(f"Error saving configuration: {str(e)}")
+        add_stream_log("ERROR", f"Error saving configuration: {str(e)}")
         return False
     finally:
         conn.close()
 
 def load_stream_configs():
     """Load all streaming configurations from database"""
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
     try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        
         cursor.execute('SELECT * FROM stream_configs ORDER BY updated_at DESC')
         configs = cursor.fetchall()
         
@@ -206,428 +292,69 @@ def load_stream_configs():
                 'auto_restart': bool(config[9])
             }
         
+        add_stream_log("INFO", f"Loaded {len(config_dict)} configurations")
         return config_dict
     except Exception as e:
-        st.error(f"Error loading configurations: {str(e)}")
+        add_stream_log("ERROR", f"Error loading configurations: {str(e)}")
         return {}
     finally:
         conn.close()
 
 def delete_stream_config(name):
     """Delete streaming configuration from database"""
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
     try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        
         cursor.execute('DELETE FROM stream_configs WHERE name = ?', (name,))
         conn.commit()
+        add_stream_log("INFO", f"Configuration '{name}' deleted successfully")
         return True
     except Exception as e:
-        st.error(f"Error deleting configuration: {str(e)}")
+        add_stream_log("ERROR", f"Error deleting configuration: {str(e)}")
         return False
     finally:
         conn.close()
 
 def save_stream_history(config_name, video_file, resolution, bitrate, duration, status, error_message=None):
     """Save streaming session to history"""
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
     try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        
         cursor.execute('''
             INSERT INTO stream_history 
             (config_name, video_file, resolution, bitrate, duration, status, end_time, error_message)
             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
         ''', (config_name, video_file, resolution, bitrate, duration, status, error_message))
         conn.commit()
+        add_stream_log("INFO", f"Stream history saved: {status}")
     except Exception as e:
-        st.error(f"Error saving stream history: {str(e)}")
+        add_stream_log("ERROR", f"Error saving stream history: {str(e)}")
     finally:
         conn.close()
 
 def get_stream_history():
     """Get streaming history from database"""
-    conn = sqlite3.connect('streaming_app.db')
-    
     try:
+        conn = sqlite3.connect('streaming_app.db')
         df = pd.read_sql_query('''
             SELECT * FROM stream_history 
             ORDER BY start_time DESC
         ''', conn)
         return df
     except Exception as e:
-        st.error(f"Error loading stream history: {str(e)}")
+        add_stream_log("ERROR", f"Error loading stream history: {str(e)}")
         return pd.DataFrame()
     finally:
         conn.close()
-
-def save_merge_history(output_file, input_files, merge_method, status, duration=None, file_size=None, error_message=None):
-    """Save video merge history to database"""
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('''
-            INSERT INTO merge_history 
-            (output_file, input_files, merge_method, status, duration, file_size, error_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (output_file, json.dumps(input_files), merge_method, status, duration, file_size, error_message))
-        conn.commit()
-    except Exception as e:
-        st.error(f"Error saving merge history: {str(e)}")
-    finally:
-        conn.close()
-
-def get_merge_history():
-    """Get video merge history from database"""
-    conn = sqlite3.connect('streaming_app.db')
-    
-    try:
-        df = pd.read_sql_query('''
-            SELECT * FROM merge_history 
-            ORDER BY created_at DESC
-        ''', conn)
-        return df
-    except Exception as e:
-        st.error(f"Error loading merge history: {str(e)}")
-        return pd.DataFrame()
-    finally:
-        conn.close()
-
-def merge_videos_concat(input_files, output_file):
-    """Merge videos using concat demuxer (fast, same format)"""
-    try:
-        # Create temporary file list
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            for video_file in input_files:
-                f.write(f"file '{os.path.abspath(video_file)}'\n")
-            temp_list = f.name
-        
-        # FFmpeg concat command
-        cmd = [
-            'ffmpeg', '-f', 'concat', '-safe', '0', '-i', temp_list,
-            '-c', 'copy', '-y', output_file
-        ]
-        
-        start_time = time.time()
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        duration = time.time() - start_time
-        
-        # Clean up temp file
-        os.unlink(temp_list)
-        
-        if result.returncode == 0:
-            file_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
-            save_merge_history(output_file, input_files, 'concat', 'success', duration, file_size)
-            return True, "Videos merged successfully using fast copy method!"
-        else:
-            error_msg = result.stderr or "Unknown error occurred"
-            save_merge_history(output_file, input_files, 'concat', 'failed', duration, 0, error_msg)
-            return False, f"Fast merge failed: {error_msg}"
-            
-    except Exception as e:
-        save_merge_history(output_file, input_files, 'concat', 'failed', 0, 0, str(e))
-        return False, f"Error during fast merge: {str(e)}"
-
-def merge_videos_filter(input_files, output_file):
-    """Merge videos using filter complex (slower, different formats)"""
-    try:
-        # Build FFmpeg command with filter complex
-        cmd = ['ffmpeg']
-        
-        # Add input files
-        for video_file in input_files:
-            cmd.extend(['-i', video_file])
-        
-        # Build filter complex
-        filter_parts = []
-        for i in range(len(input_files)):
-            filter_parts.append(f"[{i}:v][{i}:a]")
-        
-        filter_complex = f"{''.join(filter_parts)}concat=n={len(input_files)}:v=1:a=1[outv][outa]"
-        
-        cmd.extend([
-            '-filter_complex', filter_complex,
-            '-map', '[outv]', '-map', '[outa]',
-            '-c:v', 'libx264', '-c:a', 'aac',
-            '-preset', 'medium',
-            '-crf', '23',
-            '-y', output_file
-        ])
-        
-        start_time = time.time()
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        duration = time.time() - start_time
-        
-        if result.returncode == 0:
-            file_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
-            save_merge_history(output_file, input_files, 'filter', 'success', duration, file_size)
-            return True, "Videos merged successfully using re-encode method!"
-        else:
-            error_msg = result.stderr or "Unknown error occurred"
-            save_merge_history(output_file, input_files, 'filter', 'failed', duration, 0, error_msg)
-            return False, f"Re-encode merge failed: {error_msg}"
-            
-    except Exception as e:
-        save_merge_history(output_file, input_files, 'filter', 'failed', 0, 0, str(e))
-        return False, f"Error during re-encode merge: {str(e)}"
-
-def show_video_merge_section():
-    """Show video merge functionality in File Manager"""
-    st.subheader("🔗 Video Merge Tool")
-    
-    # Get available video files
-    video_files = get_video_files()
-    if st.session_state.uploaded_files:
-        video_files.extend(st.session_state.uploaded_files)
-    
-    # Remove duplicates
-    video_files = list(set(video_files))
-    
-    if len(video_files) < 2:
-        st.warning("⚠️ You need at least 2 video files to merge. Please upload more videos first.")
-        return
-    
-    with st.expander("🔗 Merge Multiple Videos", expanded=True):
-        col1, col2 = st.columns([3, 2])
-        
-        with col1:
-            st.write("**Select Videos to Merge:**")
-            # Select videos to merge
-            selected_videos = st.multiselect(
-                "Choose videos (they will be merged in the order selected)",
-                video_files,
-                help="Select at least 2 videos. The order matters - first selected will be first in the merged video."
-            )
-            
-            if len(selected_videos) >= 2:
-                st.success(f"✅ Selected {len(selected_videos)} videos for merging")
-                
-                # Show preview of selected videos
-                st.write("**Preview of selected videos:**")
-                total_duration = 0
-                total_size = 0
-                
-                for i, video in enumerate(selected_videos, 1):
-                    info = get_video_info(video)
-                    if info:
-                        total_duration += info['duration']
-                        total_size += info['size']
-                        st.text(f"{i}. {os.path.basename(video)} - Duration: {format_duration(info['duration'])} - Size: {format_file_size(info['size'])}")
-                    else:
-                        st.text(f"{i}. {os.path.basename(video)} - Could not read info")
-                
-                st.info(f"📊 **Total Duration:** {format_duration(total_duration)} | **Total Size:** {format_file_size(total_size)}")
-            
-            elif len(selected_videos) == 1:
-                st.info("Please select at least one more video to merge.")
-        
-        with col2:
-            st.write("**Merge Settings:**")
-            
-            # Merge method selection
-            merge_method = st.selectbox(
-                "Merge Method",
-                ["Auto (Recommended)", "Fast Copy", "Re-encode"],
-                help="Auto: Tries fast copy first, falls back to re-encode if needed\nFast Copy: Quick but only works with same format videos\nRe-encode: Slower but works with any video formats"
-            )
-            
-            # Output filename
-            default_name = f"merged_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-            output_name = st.text_input(
-                "Output Filename",
-                value=default_name,
-                help="Name for the merged video file (will be saved in current directory)"
-            )
-            
-            # Quality settings for re-encode
-            if merge_method == "Re-encode":
-                quality = st.selectbox(
-                    "Output Quality",
-                    ["High (CRF 18)", "Medium (CRF 23)", "Low (CRF 28)"],
-                    index=1,
-                    help="Higher quality = larger file size"
-                )
-    
-    # Merge controls
-    st.write("**Merge Controls:**")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        merge_disabled = (len(selected_videos) < 2 or 
-                         not output_name or 
-                         st.session_state.merge_active)
-        
-        if st.button("🔗 Start Merge", disabled=merge_disabled, type="primary"):
-            if not check_ffmpeg():
-                st.error("❌ FFmpeg not found. Please install FFmpeg first.")
-                return
-            
-            # Check if output file already exists
-            if os.path.exists(output_name):
-                st.warning(f"⚠️ File '{output_name}' already exists. Please choose a different name.")
-                return
-            
-            st.session_state.merge_active = True
-            
-            # Show progress
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            try:
-                status_text.text("🔄 Starting merge process...")
-                progress_bar.progress(10)
-                
-                # Determine merge method
-                success = False
-                message = ""
-                
-                if merge_method == "Fast Copy":
-                    status_text.text("🚀 Using fast copy method...")
-                    progress_bar.progress(30)
-                    success, message = merge_videos_concat(selected_videos, output_name)
-                    
-                elif merge_method == "Re-encode":
-                    status_text.text("🔄 Using re-encode method (this may take a while)...")
-                    progress_bar.progress(30)
-                    success, message = merge_videos_filter(selected_videos, output_name)
-                    
-                else:  # Auto method
-                    status_text.text("🚀 Trying fast copy method first...")
-                    progress_bar.progress(20)
-                    success, message = merge_videos_concat(selected_videos, output_name)
-                    
-                    if not success:
-                        status_text.text("🔄 Fast copy failed, trying re-encode method...")
-                        progress_bar.progress(50)
-                        success, message = merge_videos_filter(selected_videos, output_name)
-                
-                progress_bar.progress(90)
-                
-                if success:
-                    progress_bar.progress(100)
-                    status_text.text("✅ Merge completed successfully!")
-                    st.success(f"🎉 {message}")
-                    st.success(f"📁 Output saved as: **{output_name}**")
-                    
-                    # Add to uploaded files list if not already there
-                    if output_name not in st.session_state.uploaded_files:
-                        st.session_state.uploaded_files.append(output_name)
-                    
-                    # Show output file info
-                    info = get_video_info(output_name)
-                    if info:
-                        st.info(f"📊 **Merged Video Info:** Duration: {format_duration(info['duration'])} | Size: {format_file_size(info['size'])} | Resolution: {info['video_width']}x{info['video_height']}")
-                    
-                    # Auto-refresh to show new file
-                    time.sleep(2)
-                    st.rerun()
-                    
-                else:
-                    progress_bar.progress(0)
-                    status_text.text("❌ Merge failed!")
-                    st.error(f"❌ {message}")
-                    
-            except Exception as e:
-                progress_bar.progress(0)
-                status_text.text("❌ Unexpected error occurred!")
-                st.error(f"❌ Unexpected error: {str(e)}")
-                save_merge_history(output_name, selected_videos, merge_method.lower(), 'failed', 0, 0, str(e))
-            
-            finally:
-                st.session_state.merge_active = False
-    
-    with col2:
-        if st.button("🔄 Refresh List"):
-            st.rerun()
-    
-    with col3:
-        if st.button("🗑️ Clear Selection"):
-            st.rerun()
-    
-    with col4:
-        # Status indicator
-        if st.session_state.merge_active:
-            st.warning("🔄 MERGING")
-        else:
-            st.success("✅ READY")
-
-def show_merge_history():
-    """Show merge history section"""
-    st.subheader("📋 Merge History")
-    
-    merge_history = get_merge_history()
-    
-    if not merge_history.empty:
-        # Summary stats
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            total_merges = len(merge_history)
-            st.metric("Total Merges", total_merges)
-        
-        with col2:
-            successful_merges = len(merge_history[merge_history['status'] == 'success'])
-            success_rate = (successful_merges / total_merges * 100) if total_merges > 0 else 0
-            st.metric("Success Rate", f"{success_rate:.1f}%")
-        
-        with col3:
-            total_duration = merge_history['duration'].fillna(0).sum()
-            st.metric("Total Time", f"{total_duration:.1f}s")
-        
-        with col4:
-            total_size = merge_history['file_size'].fillna(0).sum()
-            st.metric("Total Output Size", format_file_size(total_size))
-        
-        # Format history for display
-        display_history = merge_history.copy()
-        display_history['created_at'] = pd.to_datetime(display_history['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        display_history['duration'] = display_history['duration'].fillna(0).apply(lambda x: f"{x:.1f}s" if x > 0 else "N/A")
-        display_history['file_size'] = display_history['file_size'].fillna(0).apply(lambda x: format_file_size(x) if x > 0 else "N/A")
-        display_history['input_count'] = display_history['input_files'].apply(lambda x: len(json.loads(x)) if x else 0)
-        
-        # Select columns to show
-        columns_to_show = ['created_at', 'output_file', 'input_count', 'merge_method', 'status', 'duration', 'file_size']
-        display_history = display_history[columns_to_show]
-        display_history.columns = ['Date', 'Output File', 'Input Count', 'Method', 'Status', 'Duration', 'Size']
-        
-        st.dataframe(
-            display_history,
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        # Export merge history
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📊 Export Merge History to CSV"):
-                csv = merge_history.to_csv(index=False)
-                st.download_button(
-                    label="💾 Download CSV",
-                    data=csv,
-                    file_name=f"merge_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-        
-        with col2:
-            if st.button("🗑️ Clear Merge History"):
-                if st.button("⚠️ Confirm Clear History"):
-                    conn = sqlite3.connect('streaming_app.db')
-                    cursor = conn.cursor()
-                    cursor.execute("DELETE FROM merge_history")
-                    conn.commit()
-                    conn.close()
-                    st.success("✅ Merge history cleared!")
-                    st.rerun()
-    else:
-        st.info("📝 No merge history available yet. Start merging videos to see history here.")
 
 def get_app_setting(key, default_value):
     """Get application setting from database"""
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
     try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        
         cursor.execute('SELECT value FROM app_settings WHERE key = ?', (key,))
         result = cursor.fetchone()
         return result[0] if result else default_value
@@ -638,27 +365,45 @@ def get_app_setting(key, default_value):
 
 def set_app_setting(key, value):
     """Set application setting in database"""
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
     try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        
         cursor.execute('''
             INSERT OR REPLACE INTO app_settings (key, value, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
         ''', (key, str(value)))
         conn.commit()
     except Exception as e:
-        st.error(f"Error saving setting: {str(e)}")
+        add_stream_log("ERROR", f"Error saving setting: {str(e)}")
     finally:
         conn.close()
 
 def check_ffmpeg():
     """Check if FFmpeg is available"""
     try:
+        add_stream_log("INFO", "Checking FFmpeg availability...")
         result = subprocess.run(['ffmpeg', '-version'], 
                               capture_output=True, text=True, timeout=10)
-        return result.returncode == 0
-    except Exception:
+        
+        if result.returncode == 0:
+            add_stream_log("INFO", "FFmpeg is available")
+            # Extract version info
+            version_line = result.stdout.split('\n')[0]
+            add_stream_log("INFO", f"FFmpeg version: {version_line}")
+            return True
+        else:
+            add_stream_log("ERROR", f"FFmpeg check failed with return code: {result.returncode}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        add_stream_log("ERROR", "FFmpeg version check timed out")
+        return False
+    except FileNotFoundError:
+        add_stream_log("ERROR", "FFmpeg not found in PATH")
+        return False
+    except Exception as e:
+        add_stream_log("ERROR", f"Error checking FFmpeg: {str(e)}")
         return False
 
 def get_video_files(directory="."):
@@ -667,156 +412,428 @@ def get_video_files(directory="."):
     video_files = []
     
     try:
+        add_stream_log("INFO", f"Scanning directory for video files: {directory}")
         for file_path in Path(directory).rglob('*'):
             if file_path.is_file() and file_path.suffix.lower() in video_extensions:
                 video_files.append(str(file_path))
+        
+        add_stream_log("INFO", f"Found {len(video_files)} video files")
+        return sorted(video_files)
+        
     except Exception as e:
-        st.error(f"Error scanning directory: {str(e)}")
-    
-    return sorted(video_files)
+        add_stream_log("ERROR", f"Error scanning directory: {str(e)}")
+        return []
 
-def monitor_stream_output(process, log_queue):
+def monitor_stream_output(process, log_queue, session_id):
     """Monitor FFmpeg output in separate thread"""
     try:
-        for line in iter(process.stderr.readline, b''):
-            if line:
-                log_queue.put(line.decode('utf-8', errors='ignore').strip())
+        add_stream_log("INFO", "Starting stream output monitoring thread")
+        
+        while process.poll() is None:
+            try:
+                # Read from stderr (FFmpeg outputs to stderr)
+                line = process.stderr.readline()
+                if line:
+                    decoded_line = line.decode('utf-8', errors='ignore').strip()
+                    if decoded_line:
+                        log_queue.put(decoded_line)
+                        
+                        # Log important messages
+                        if 'error' in decoded_line.lower():
+                            add_stream_log("ERROR", f"FFmpeg error: {decoded_line}")
+                        elif 'warning' in decoded_line.lower():
+                            add_stream_log("WARNING", f"FFmpeg warning: {decoded_line}")
+                        elif 'frame=' in decoded_line:
+                            # This is a progress line, don't spam logs
+                            pass
+                        else:
+                            add_stream_log("DEBUG", f"FFmpeg: {decoded_line}")
+                            
+            except Exception as e:
+                add_stream_log("ERROR", f"Error reading FFmpeg output: {str(e)}")
+                break
+                
+        add_stream_log("INFO", "Stream output monitoring thread ended")
+        
     except Exception as e:
-        log_queue.put(f"Monitor error: {str(e)}")
+        add_stream_log("ERROR", f"Monitor thread error: {str(e)}")
 
 def parse_ffmpeg_stats(line):
     """Parse FFmpeg statistics from output line"""
     stats = {}
     
-    # Parse frame number
-    frame_match = re.search(r'frame=\s*(\d+)', line)
-    if frame_match:
-        stats['frame'] = int(frame_match.group(1))
-    
-    # Parse FPS
-    fps_match = re.search(r'fps=\s*([\d.]+)', line)
-    if fps_match:
-        stats['fps'] = float(fps_match.group(1))
-    
-    # Parse bitrate
-    bitrate_match = re.search(r'bitrate=\s*([\d.]+)kbits/s', line)
-    if bitrate_match:
-        stats['bitrate'] = float(bitrate_match.group(1))
-    
-    # Parse time
-    time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2})', line)
-    if time_match:
-        hours, minutes, seconds = map(int, time_match.groups())
-        stats['time'] = hours * 3600 + minutes * 60 + seconds
+    try:
+        # Parse frame number
+        frame_match = re.search(r'frame=\s*(\d+)', line)
+        if frame_match:
+            stats['frame'] = int(frame_match.group(1))
+        
+        # Parse FPS
+        fps_match = re.search(r'fps=\s*([\d.]+)', line)
+        if fps_match:
+            stats['fps'] = float(fps_match.group(1))
+        
+        # Parse bitrate
+        bitrate_match = re.search(r'bitrate=\s*([\d.]+)kbits/s', line)
+        if bitrate_match:
+            stats['bitrate'] = float(bitrate_match.group(1))
+        
+        # Parse time
+        time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2})', line)
+        if time_match:
+            hours, minutes, seconds = map(int, time_match.groups())
+            stats['time'] = hours * 3600 + minutes * 60 + seconds
+        
+        # Parse speed
+        speed_match = re.search(r'speed=\s*([\d.]+)x', line)
+        if speed_match:
+            stats['speed'] = float(speed_match.group(1))
+            
+    except Exception as e:
+        add_stream_log("ERROR", f"Error parsing FFmpeg stats: {str(e)}")
     
     return stats
 
+def validate_stream_key(stream_key):
+    """Validate YouTube stream key format"""
+    if not stream_key:
+        return False, "Stream key is empty"
+    
+    if len(stream_key) < 10:
+        return False, "Stream key is too short"
+    
+    # YouTube stream keys are typically alphanumeric with dashes
+    if not re.match(r'^[a-zA-Z0-9\-_]+$', stream_key):
+        return False, "Stream key contains invalid characters"
+    
+    return True, "Stream key is valid"
+
+def test_rtmp_connection(stream_key):
+    """Test RTMP connection to YouTube"""
+    try:
+        add_stream_log("INFO", "Testing RTMP connection to YouTube...")
+        
+        rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+        
+        # Create a simple test command
+        cmd = [
+            'ffmpeg', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=1',
+            '-f', 'flv', '-t', '1', rtmp_url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0:
+            add_stream_log("INFO", "RTMP connection test successful")
+            return True, "Connection successful"
+        else:
+            add_stream_log("ERROR", f"RTMP connection test failed: {result.stderr}")
+            return False, f"Connection failed: {result.stderr}"
+            
+    except subprocess.TimeoutExpired:
+        add_stream_log("ERROR", "RTMP connection test timed out")
+        return False, "Connection test timed out"
+    except Exception as e:
+        add_stream_log("ERROR", f"Error testing RTMP connection: {str(e)}")
+        return False, f"Connection test error: {str(e)}"
+
 def start_streaming(stream_key, video_file, resolution, bitrate, shorts_mode=False, 
                    audio_bitrate=128, encoding_preset='medium'):
-    """Start streaming process"""
-    if not check_ffmpeg():
-        st.error("FFmpeg not found. Please install FFmpeg and add it to your PATH.")
-        return False
-    
-    if not os.path.exists(video_file):
-        st.error(f"Video file not found: {video_file}")
-        return False
-    
-    # Build FFmpeg command
-    rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-    
-    cmd = ['ffmpeg', '-re', '-i', video_file]
-    
-    # Video encoding settings
-    if resolution == "Original":
-        cmd.extend(['-c:v', 'libx264'])
-    else:
-        width, height = resolution.split('x')
-        if shorts_mode:
-            # For shorts, maintain 9:16 aspect ratio
-            cmd.extend(['-vf', f'scale=720:1280,pad=720:1280:(ow-iw)/2:(oh-ih)/2'])
-        else:
-            cmd.extend(['-vf', f'scale={width}:{height}'])
-        cmd.extend(['-c:v', 'libx264'])
-    
-    # Encoding settings
-    cmd.extend([
-        '-preset', encoding_preset,
-        '-b:v', f'{bitrate}k',
-        '-maxrate', f'{int(bitrate * 1.2)}k',
-        '-bufsize', f'{int(bitrate * 2)}k',
-        '-g', '60',  # GOP size
-        '-keyint_min', '60',
-        '-sc_threshold', '0'
-    ])
-    
-    # Audio settings
-    cmd.extend([
-        '-c:a', 'aac',
-        '-b:a', f'{audio_bitrate}k',
-        '-ar', '44100'
-    ])
-    
-    # Output settings
-    cmd.extend([
-        '-f', 'flv',
-        '-flvflags', 'no_duration_filesize',
-        rtmp_url
-    ])
-    
+    """Start streaming process with comprehensive error handling"""
     try:
+        add_stream_log("INFO", "=== STARTING STREAMING SESSION ===")
+        add_stream_log("INFO", f"Stream key: {stream_key[:10]}...")
+        add_stream_log("INFO", f"Video file: {video_file}")
+        add_stream_log("INFO", f"Resolution: {resolution}")
+        add_stream_log("INFO", f"Bitrate: {bitrate}k")
+        add_stream_log("INFO", f"Shorts mode: {shorts_mode}")
+        add_stream_log("INFO", f"Audio bitrate: {audio_bitrate}k")
+        add_stream_log("INFO", f"Encoding preset: {encoding_preset}")
+        
+        # Check FFmpeg
+        if not check_ffmpeg():
+            add_stream_log("ERROR", "FFmpeg not found. Please install FFmpeg and add it to your PATH.")
+            return False
+        
+        # Validate stream key
+        is_valid, message = validate_stream_key(stream_key)
+        if not is_valid:
+            add_stream_log("ERROR", f"Invalid stream key: {message}")
+            return False
+        
+        # Check video file
+        if not os.path.exists(video_file):
+            add_stream_log("ERROR", f"Video file not found: {video_file}")
+            return False
+        
+        # Get video info
+        video_info = get_video_info(video_file)
+        if not video_info:
+            add_stream_log("ERROR", "Could not read video file information")
+            return False
+        
+        add_stream_log("INFO", f"Video duration: {format_duration(video_info['duration'])}")
+        add_stream_log("INFO", f"Video resolution: {video_info['video_width']}x{video_info['video_height']}")
+        
+        # Build FFmpeg command
+        rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+        add_stream_log("INFO", f"RTMP URL: rtmp://a.rtmp.youtube.com/live2/{stream_key[:10]}...")
+        
+        cmd = ['ffmpeg', '-y', '-re', '-i', video_file]
+        
+        # Video encoding settings
+        if resolution == "Original":
+            add_stream_log("INFO", "Using original resolution")
+            cmd.extend(['-c:v', 'libx264'])
+        else:
+            width, height = resolution.split('x')
+            if shorts_mode:
+                add_stream_log("INFO", "Applying YouTube Shorts format (9:16)")
+                cmd.extend(['-vf', f'scale=720:1280,pad=720:1280:(ow-iw)/2:(oh-ih)/2'])
+            else:
+                add_stream_log("INFO", f"Scaling to {width}x{height}")
+                cmd.extend(['-vf', f'scale={width}:{height}'])
+            cmd.extend(['-c:v', 'libx264'])
+        
+        # Encoding settings
+        cmd.extend([
+            '-preset', encoding_preset,
+            '-b:v', f'{bitrate}k',
+            '-maxrate', f'{int(bitrate * 1.2)}k',
+            '-bufsize', f'{int(bitrate * 2)}k',
+            '-g', '60',  # GOP size
+            '-keyint_min', '60',
+            '-sc_threshold', '0',
+            '-pix_fmt', 'yuv420p'
+        ])
+        
+        # Audio settings
+        cmd.extend([
+            '-c:a', 'aac',
+            '-b:a', f'{audio_bitrate}k',
+            '-ar', '44100',
+            '-ac', '2'
+        ])
+        
+        # Output settings
+        cmd.extend([
+            '-f', 'flv',
+            '-flvflags', 'no_duration_filesize',
+            rtmp_url
+        ])
+        
+        add_stream_log("INFO", f"FFmpeg command: {' '.join(cmd[:10])}... [truncated for security]")
+        
         # Start FFmpeg process
+        add_stream_log("INFO", "Starting FFmpeg process...")
+        
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            universal_newlines=False
+            universal_newlines=False,
+            bufsize=1
         )
+        
+        add_stream_log("INFO", f"FFmpeg process started with PID: {process.pid}")
         
         # Start monitoring thread
         monitor_thread = threading.Thread(
             target=monitor_stream_output,
-            args=(process, st.session_state.log_queue),
+            args=(process, st.session_state.log_queue, st.session_state.session_id),
             daemon=True
         )
         monitor_thread.start()
+        add_stream_log("INFO", "Monitoring thread started")
         
+        # Store process info
         st.session_state.streaming_process = process
         st.session_state.streaming_active = True
         st.session_state.stream_start_time = time.time()
         
+        add_stream_log("INFO", "=== STREAMING SESSION STARTED SUCCESSFULLY ===")
         return True
         
     except Exception as e:
-        st.error(f"Error starting stream: {str(e)}")
+        add_stream_log("ERROR", f"Error starting stream: {str(e)}")
         return False
 
 def stop_streaming():
     """Stop streaming process"""
-    if st.session_state.streaming_process:
-        try:
-            st.session_state.streaming_process.terminate()
-            st.session_state.streaming_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            st.session_state.streaming_process.kill()
-        except Exception as e:
-            st.error(f"Error stopping stream: {str(e)}")
+    try:
+        add_stream_log("INFO", "=== STOPPING STREAMING SESSION ===")
         
+        if st.session_state.streaming_process:
+            process = st.session_state.streaming_process
+            add_stream_log("INFO", f"Terminating FFmpeg process (PID: {process.pid})")
+            
+            try:
+                process.terminate()
+                add_stream_log("INFO", "Sent SIGTERM to FFmpeg process")
+                
+                # Wait for graceful shutdown
+                try:
+                    process.wait(timeout=10)
+                    add_stream_log("INFO", "FFmpeg process terminated gracefully")
+                except subprocess.TimeoutExpired:
+                    add_stream_log("WARNING", "FFmpeg process did not terminate gracefully, forcing kill")
+                    process.kill()
+                    process.wait()
+                    add_stream_log("INFO", "FFmpeg process killed")
+                    
+            except Exception as e:
+                add_stream_log("ERROR", f"Error stopping FFmpeg process: {str(e)}")
+        
+        # Calculate session duration
+        if hasattr(st.session_state, 'stream_start_time'):
+            duration = time.time() - st.session_state.stream_start_time
+            add_stream_log("INFO", f"Stream duration: {format_duration(duration)}")
+        
+        # Reset state
         st.session_state.streaming_process = None
         st.session_state.streaming_active = False
         st.session_state.stream_stats = {}
+        
+        add_stream_log("INFO", "=== STREAMING SESSION STOPPED ===")
+        
+    except Exception as e:
+        add_stream_log("ERROR", f"Error stopping stream: {str(e)}")
 
 def emergency_stop():
     """Emergency stop - force kill streaming process"""
-    if st.session_state.streaming_process:
-        try:
-            st.session_state.streaming_process.kill()
-        except Exception:
-            pass
+    try:
+        add_stream_log("WARNING", "=== EMERGENCY STOP INITIATED ===")
         
+        if st.session_state.streaming_process:
+            process = st.session_state.streaming_process
+            add_stream_log("WARNING", f"Force killing FFmpeg process (PID: {process.pid})")
+            
+            try:
+                process.kill()
+                process.wait()
+                add_stream_log("WARNING", "FFmpeg process force killed")
+            except Exception as e:
+                add_stream_log("ERROR", f"Error during emergency stop: {str(e)}")
+        
+        # Reset state
         st.session_state.streaming_process = None
         st.session_state.streaming_active = False
         st.session_state.stream_stats = {}
+        
+        add_stream_log("WARNING", "=== EMERGENCY STOP COMPLETED ===")
+        
+    except Exception as e:
+        add_stream_log("ERROR", f"Error during emergency stop: {str(e)}")
+
+def merge_videos(input_files, output_file, method='auto'):
+    """Merge multiple video files"""
+    try:
+        add_stream_log("INFO", f"Starting video merge: {len(input_files)} files")
+        add_stream_log("INFO", f"Output file: {output_file}")
+        add_stream_log("INFO", f"Merge method: {method}")
+        
+        if len(input_files) < 2:
+            add_stream_log("ERROR", "Need at least 2 files to merge")
+            return False, "Need at least 2 files to merge"
+        
+        # Check if all input files exist
+        for file_path in input_files:
+            if not os.path.exists(file_path):
+                add_stream_log("ERROR", f"Input file not found: {file_path}")
+                return False, f"Input file not found: {file_path}"
+        
+        if method == 'fast' or method == 'auto':
+            # Try fast copy method first
+            add_stream_log("INFO", "Attempting fast copy merge...")
+            
+            # Create file list for concat
+            list_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            try:
+                for file_path in input_files:
+                    list_file.write(f"file '{os.path.abspath(file_path)}'\n")
+                list_file.close()
+                
+                cmd = [
+                    'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                    '-i', list_file.name, '-c', 'copy', output_file
+                ]
+                
+                add_stream_log("INFO", f"Running fast merge command: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                
+                if result.returncode == 0:
+                    add_stream_log("INFO", "Fast copy merge successful")
+                    return True, "Merge completed successfully (fast copy)"
+                else:
+                    add_stream_log("WARNING", f"Fast copy failed: {result.stderr}")
+                    if method == 'fast':
+                        return False, f"Fast copy merge failed: {result.stderr}"
+                    # Fall back to re-encode for auto method
+                    
+            finally:
+                try:
+                    os.unlink(list_file.name)
+                except:
+                    pass
+        
+        if method == 're-encode' or method == 'auto':
+            # Re-encode method
+            add_stream_log("INFO", "Using re-encode merge method...")
+            
+            # Build complex filter
+            inputs = []
+            filter_complex = ""
+            
+            for i, file_path in enumerate(input_files):
+                inputs.extend(['-i', file_path])
+                filter_complex += f"[{i}:v][{i}:a]"
+            
+            filter_complex += f"concat=n={len(input_files)}:v=1:a=1[outv][outa]"
+            
+            cmd = ['ffmpeg', '-y'] + inputs + [
+                '-filter_complex', filter_complex,
+                '-map', '[outv]', '-map', '[outa]',
+                '-c:v', 'libx264', '-c:a', 'aac',
+                '-preset', 'medium', '-crf', '23',
+                output_file
+            ]
+            
+            add_stream_log("INFO", f"Running re-encode merge command")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            
+            if result.returncode == 0:
+                add_stream_log("INFO", "Re-encode merge successful")
+                return True, "Merge completed successfully (re-encoded)"
+            else:
+                add_stream_log("ERROR", f"Re-encode merge failed: {result.stderr}")
+                return False, f"Re-encode merge failed: {result.stderr}"
+        
+        return False, "Unknown merge method"
+        
+    except subprocess.TimeoutExpired:
+        add_stream_log("ERROR", "Video merge timed out")
+        return False, "Merge operation timed out"
+    except Exception as e:
+        add_stream_log("ERROR", f"Error during video merge: {str(e)}")
+        return False, f"Merge error: {str(e)}"
+
+def save_merge_history(output_file, input_files, method, duration, file_size, status, error_message=None):
+    """Save merge operation to history"""
+    try:
+        conn = sqlite3.connect('streaming_app.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO merge_history 
+            (output_file, input_files, merge_method, duration, file_size, status, error_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (output_file, json.dumps(input_files), method, duration, file_size, status, error_message))
+        conn.commit()
+        add_stream_log("INFO", f"Merge history saved: {status}")
+    except Exception as e:
+        add_stream_log("ERROR", f"Error saving merge history: {str(e)}")
+    finally:
+        conn.close()
 
 def show_control_panel():
     """Main streaming control panel"""
@@ -826,6 +843,7 @@ def show_control_panel():
     if not check_ffmpeg():
         st.error("⚠️ FFmpeg not detected! Please install FFmpeg to use this application.")
         st.info("Download FFmpeg from: https://ffmpeg.org/download.html")
+        add_stream_log("ERROR", "FFmpeg not available")
         return
     
     # Configuration section
@@ -850,6 +868,16 @@ def show_control_panel():
                 value=saved_configs.get(selected_config, {}).get('stream_key', ''),
                 help="Get this from YouTube Studio > Go Live"
             )
+            
+            # Test stream key button
+            if stream_key and st.button("🔍 Test Stream Key"):
+                is_valid, message = validate_stream_key(stream_key)
+                if is_valid:
+                    st.success("✅ Stream key format is valid")
+                    add_stream_log("INFO", "Stream key validation passed")
+                else:
+                    st.error(f"❌ {message}")
+                    add_stream_log("ERROR", f"Stream key validation failed: {message}")
             
             # Video file selection
             video_files = get_video_files()
@@ -970,6 +998,8 @@ def show_control_panel():
                              shorts_mode, audio_bitrate, encoding_preset):
                 st.success("🚀 Streaming started!")
                 st.rerun()
+            else:
+                st.error("❌ Failed to start streaming. Check logs for details.")
     
     with col2:
         if st.button("⏹️ Stop Streaming", 
@@ -1014,7 +1044,7 @@ def show_live_statistics():
             break
     
     if st.session_state.stream_stats:
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
             st.metric("Frame", st.session_state.stream_stats.get('frame', 0))
@@ -1028,41 +1058,77 @@ def show_live_statistics():
         with col4:
             elapsed = st.session_state.stream_stats.get('time', 0)
             st.metric("Time", format_duration(elapsed))
+        
+        with col5:
+            speed = st.session_state.stream_stats.get('speed', 0)
+            st.metric("Speed", f"{speed:.2f}x")
     
-    # Auto-refresh every 2 seconds
-    if st.session_state.streaming_active:
-        time.sleep(2)
-        st.rerun()
+    # Process status
+    if st.session_state.streaming_process:
+        process = st.session_state.streaming_process
+        if process.poll() is None:
+            st.success("✅ FFmpeg process is running")
+        else:
+            st.error(f"❌ FFmpeg process ended with code: {process.returncode}")
+            add_stream_log("ERROR", f"FFmpeg process ended unexpectedly with code: {process.returncode}")
 
 def show_live_logs():
-    """Show live FFmpeg logs"""
+    """Show live streaming logs"""
     with st.expander("📋 Live Logs", expanded=False):
-        log_container = st.container()
         
-        # Collect recent logs
-        logs = []
-        temp_queue = queue.Queue()
+        # Log level filter
+        col1, col2, col3 = st.columns([1, 1, 2])
+        with col1:
+            log_level_filter = st.selectbox(
+                "Filter Level",
+                ["ALL", "ERROR", "WARNING", "INFO", "DEBUG"],
+                index=0
+            )
         
-        while not st.session_state.log_queue.empty():
-            try:
-                line = st.session_state.log_queue.get_nowait()
-                logs.append(line)
-                temp_queue.put(line)
-            except queue.Empty:
-                break
+        with col2:
+            if st.button("🗑️ Clear Logs"):
+                st.session_state.stream_logs = []
+                add_stream_log("INFO", "Logs cleared by user")
+                st.rerun()
         
-        # Put logs back in queue for statistics processing
-        while not temp_queue.empty():
-            st.session_state.log_queue.put(temp_queue.get())
+        with col3:
+            auto_scroll = st.checkbox("Auto-scroll to bottom", value=True)
         
-        # Display recent logs
-        if logs:
+        # Display logs
+        if st.session_state.stream_logs:
+            # Filter logs by level
+            filtered_logs = st.session_state.stream_logs
+            if log_level_filter != "ALL":
+                filtered_logs = [log for log in st.session_state.stream_logs if log_level_filter in log]
+            
+            # Create scrollable log container
+            log_container = st.container()
+            
             with log_container:
-                for log_line in logs[-20:]:  # Show last 20 lines
-                    st.text(log_line)
+                # Show logs in a text area for better formatting
+                log_text = "\n".join(filtered_logs[-50:])  # Show last 50 logs
+                st.text_area(
+                    "Logs",
+                    value=log_text,
+                    height=300,
+                    disabled=True,
+                    key="log_display"
+                )
+        else:
+            st.info("No logs available yet. Start streaming to see logs.")
+        
+        # Export logs
+        if st.session_state.stream_logs:
+            log_export = "\n".join(st.session_state.stream_logs)
+            st.download_button(
+                "📥 Download Logs",
+                data=log_export,
+                file_name=f"streaming_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain"
+            )
 
 def show_file_manager():
-    """File manager interface"""
+    """File manager interface with video merge functionality"""
     st.header("📁 File Manager")
     
     # Current directory info
@@ -1086,18 +1152,128 @@ def show_file_manager():
             
             if file_path not in st.session_state.uploaded_files:
                 st.session_state.uploaded_files.append(file_path)
+            
+            add_stream_log("INFO", f"File uploaded: {uploaded_file.name}")
         
         st.success(f"✅ Uploaded {len(uploaded_files)} file(s)")
     
-    # Video merge section - ADD THIS HERE
-    show_video_merge_section()
+    # Video merge tool
+    st.subheader("🔗 Video Merge Tool")
     
-    # Merge history section
-    show_merge_history()
+    video_files = get_video_files()
+    if st.session_state.uploaded_files:
+        video_files.extend(st.session_state.uploaded_files)
+    
+    if len(video_files) >= 2:
+        with st.expander("🔗 Merge Videos", expanded=True):
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                # Multi-select for videos to merge
+                selected_videos = st.multiselect(
+                    "Select videos to merge (in order)",
+                    video_files,
+                    help="Select videos in the order you want them merged"
+                )
+                
+                if len(selected_videos) >= 2:
+                    # Show preview of selected videos
+                    st.write("**Selected videos:**")
+                    total_duration = 0
+                    total_size = 0
+                    
+                    for i, video in enumerate(selected_videos):
+                        info = get_video_info(video)
+                        if info:
+                            duration = info['duration']
+                            size = info['size']
+                            total_duration += duration
+                            total_size += size
+                            
+                            st.write(f"{i+1}. {os.path.basename(video)} - "
+                                   f"{format_duration(duration)} - "
+                                   f"{format_file_size(size)}")
+                    
+                    st.write(f"**Total duration:** {format_duration(total_duration)}")
+                    st.write(f"**Total size:** {format_file_size(total_size)}")
+            
+            with col2:
+                # Merge settings
+                merge_method = st.selectbox(
+                    "Merge Method",
+                    ["auto", "fast", "re-encode"],
+                    help="Auto: Try fast first, fallback to re-encode\n"
+                         "Fast: Quick copy (same format only)\n"
+                         "Re-encode: Slower but works with any formats"
+                )
+                
+                # Output filename
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                default_output = f"merged_video_{timestamp}.mp4"
+                output_filename = st.text_input(
+                    "Output filename",
+                    value=default_output
+                )
+                
+                # Merge button
+                if st.button("🔗 Start Merge", 
+                           disabled=len(selected_videos) < 2,
+                           type="primary"):
+                    
+                    if len(selected_videos) < 2:
+                        st.error("Please select at least 2 videos to merge")
+                    else:
+                        with st.spinner("Merging videos..."):
+                            start_time = time.time()
+                            
+                            success, message = merge_videos(
+                                selected_videos, 
+                                output_filename, 
+                                merge_method
+                            )
+                            
+                            end_time = time.time()
+                            merge_duration = end_time - start_time
+                            
+                            if success:
+                                st.success(f"✅ {message}")
+                                
+                                # Get output file info
+                                if os.path.exists(output_filename):
+                                    file_size = os.path.getsize(output_filename)
+                                    st.session_state.uploaded_files.append(output_filename)
+                                    
+                                    # Save to history
+                                    save_merge_history(
+                                        output_filename, 
+                                        selected_videos, 
+                                        merge_method,
+                                        merge_duration,
+                                        file_size,
+                                        "success"
+                                    )
+                                    
+                                    st.info(f"📁 Merged file saved as: {output_filename}")
+                                    st.rerun()
+                                
+                            else:
+                                st.error(f"❌ {message}")
+                                
+                                # Save failed attempt to history
+                                save_merge_history(
+                                    output_filename,
+                                    selected_videos,
+                                    merge_method,
+                                    merge_duration,
+                                    0,
+                                    "failed",
+                                    message
+                                )
+    else:
+        st.info("Upload at least 2 video files to use the merge tool.")
     
     # Video files list
     st.subheader("🎬 Video Files")
-    video_files = get_video_files()
     
     if video_files:
         for video_file in video_files:
@@ -1126,9 +1302,11 @@ def show_file_manager():
                             if video_file in st.session_state.uploaded_files:
                                 st.session_state.uploaded_files.remove(video_file)
                             st.success(f"Deleted {os.path.basename(video_file)}")
+                            add_stream_log("INFO", f"File deleted: {os.path.basename(video_file)}")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Error deleting file: {str(e)}")
+                            add_stream_log("ERROR", f"Error deleting file: {str(e)}")
     else:
         st.info("No video files found in the current directory.")
     
@@ -1140,8 +1318,10 @@ def show_file_manager():
                 if os.path.exists(file_path):
                     os.remove(file_path)
                 st.session_state.uploaded_files.remove(file_path)
+                add_stream_log("INFO", f"Cleaned up file: {os.path.basename(file_path)}")
             except Exception as e:
                 st.error(f"Error removing {file_path}: {str(e)}")
+                add_stream_log("ERROR", f"Error removing {file_path}: {str(e)}")
         
         st.success("✅ Cleared all uploaded files")
         st.rerun()
@@ -1261,17 +1441,14 @@ def show_settings():
         cursor.execute("SELECT COUNT(*) FROM stream_history")
         history_count = cursor.fetchone()[0]
         
-        try:
-            cursor.execute("SELECT COUNT(*) FROM merge_history")
-            merge_count = cursor.fetchone()[0]
-        except:
-            merge_count = 0
+        cursor.execute("SELECT COUNT(*) FROM streaming_logs")
+        log_count = cursor.fetchone()[0]
         
         conn.close()
         
         st.info(f"**Saved Configurations:** {config_count}")
         st.info(f"**Stream History Records:** {history_count}")
-        st.info(f"**Merge History Records:** {merge_count}")
+        st.info(f"**Log Records:** {log_count}")
     
     # Application settings
     st.subheader("🔧 Application Settings")
@@ -1342,18 +1519,18 @@ def show_settings():
                     cursor.execute("DELETE FROM stream_configs")
                     cursor.execute("DELETE FROM stream_history")
                     cursor.execute("DELETE FROM app_settings")
-                    try:
-                        cursor.execute("DELETE FROM merge_history")
-                    except:
-                        pass
+                    cursor.execute("DELETE FROM merge_history")
+                    cursor.execute("DELETE FROM streaming_logs")
                     
                     conn.commit()
                     conn.close()
                     
                     st.success("✅ Database reset successfully!")
+                    add_stream_log("INFO", "Database reset by user")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error resetting database: {str(e)}")
+                    add_stream_log("ERROR", f"Error resetting database: {str(e)}")
     
     with col2:
         if st.button("📤 Export Database"):
@@ -1372,9 +1549,11 @@ def show_settings():
                 
                 # Clean up temporary file
                 os.remove(backup_path)
+                add_stream_log("INFO", "Database exported successfully")
                 
             except Exception as e:
                 st.error(f"Error creating backup: {str(e)}")
+                add_stream_log("ERROR", f"Error creating backup: {str(e)}")
     
     with col3:
         uploaded_db = st.file_uploader("📥 Import Database", type=['db'])
@@ -1393,13 +1572,16 @@ def show_settings():
                 if any('stream_configs' in str(table) for table in tables):
                     shutil.move('streaming_app_temp.db', 'streaming_app.db')
                     st.success("✅ Database imported successfully!")
+                    add_stream_log("INFO", "Database imported successfully")
                     st.rerun()
                 else:
                     os.remove('streaming_app_temp.db')
                     st.error("Invalid database file format")
+                    add_stream_log("ERROR", "Invalid database file format")
                     
             except Exception as e:
                 st.error(f"Error importing database: {str(e)}")
+                add_stream_log("ERROR", f"Error importing database: {str(e)}")
                 if os.path.exists('streaming_app_temp.db'):
                     os.remove('streaming_app_temp.db')
 
