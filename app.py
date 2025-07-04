@@ -68,7 +68,7 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             output_file TEXT NOT NULL,
             input_files TEXT NOT NULL,
-            merge_type TEXT NOT NULL,
+            merge_method TEXT NOT NULL,
             status TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             duration REAL,
@@ -261,7 +261,7 @@ def get_stream_history():
     finally:
         conn.close()
 
-def save_merge_history(output_file, input_files, merge_type, status, duration=None, file_size=None, error_message=None):
+def save_merge_history(output_file, input_files, merge_method, status, duration=None, file_size=None, error_message=None):
     """Save video merge history to database"""
     conn = sqlite3.connect('streaming_app.db')
     cursor = conn.cursor()
@@ -269,9 +269,9 @@ def save_merge_history(output_file, input_files, merge_type, status, duration=No
     try:
         cursor.execute('''
             INSERT INTO merge_history 
-            (output_file, input_files, merge_type, status, duration, file_size, error_message)
+            (output_file, input_files, merge_method, status, duration, file_size, error_message)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (output_file, json.dumps(input_files), merge_type, status, duration, file_size, error_message))
+        ''', (output_file, json.dumps(input_files), merge_method, status, duration, file_size, error_message))
         conn.commit()
     except Exception as e:
         st.error(f"Error saving merge history: {str(e)}")
@@ -295,7 +295,7 @@ def get_merge_history():
         conn.close()
 
 def merge_videos_concat(input_files, output_file):
-    """Merge videos using concat demuxer (same format)"""
+    """Merge videos using concat demuxer (fast, same format)"""
     try:
         # Create temporary file list
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
@@ -319,18 +319,18 @@ def merge_videos_concat(input_files, output_file):
         if result.returncode == 0:
             file_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
             save_merge_history(output_file, input_files, 'concat', 'success', duration, file_size)
-            return True, "Videos merged successfully!"
+            return True, "Videos merged successfully using fast copy method!"
         else:
             error_msg = result.stderr or "Unknown error occurred"
             save_merge_history(output_file, input_files, 'concat', 'failed', duration, 0, error_msg)
-            return False, f"Merge failed: {error_msg}"
+            return False, f"Fast merge failed: {error_msg}"
             
     except Exception as e:
         save_merge_history(output_file, input_files, 'concat', 'failed', 0, 0, str(e))
-        return False, f"Error during merge: {str(e)}"
+        return False, f"Error during fast merge: {str(e)}"
 
 def merge_videos_filter(input_files, output_file):
-    """Merge videos using filter complex (different formats)"""
+    """Merge videos using filter complex (slower, different formats)"""
     try:
         # Build FFmpeg command with filter complex
         cmd = ['ffmpeg']
@@ -350,6 +350,8 @@ def merge_videos_filter(input_files, output_file):
             '-filter_complex', filter_complex,
             '-map', '[outv]', '-map', '[outa]',
             '-c:v', 'libx264', '-c:a', 'aac',
+            '-preset', 'medium',
+            '-crf', '23',
             '-y', output_file
         ])
         
@@ -360,18 +362,18 @@ def merge_videos_filter(input_files, output_file):
         if result.returncode == 0:
             file_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
             save_merge_history(output_file, input_files, 'filter', 'success', duration, file_size)
-            return True, "Videos merged successfully!"
+            return True, "Videos merged successfully using re-encode method!"
         else:
             error_msg = result.stderr or "Unknown error occurred"
             save_merge_history(output_file, input_files, 'filter', 'failed', duration, 0, error_msg)
-            return False, f"Merge failed: {error_msg}"
+            return False, f"Re-encode merge failed: {error_msg}"
             
     except Exception as e:
         save_merge_history(output_file, input_files, 'filter', 'failed', 0, 0, str(e))
-        return False, f"Error during merge: {str(e)}"
+        return False, f"Error during re-encode merge: {str(e)}"
 
 def show_video_merge_section():
-    """Show video merge functionality"""
+    """Show video merge functionality in File Manager"""
     st.subheader("🔗 Video Merge Tool")
     
     # Get available video files
@@ -379,25 +381,30 @@ def show_video_merge_section():
     if st.session_state.uploaded_files:
         video_files.extend(st.session_state.uploaded_files)
     
+    # Remove duplicates
+    video_files = list(set(video_files))
+    
     if len(video_files) < 2:
-        st.warning("⚠️ You need at least 2 video files to merge. Please upload more videos.")
+        st.warning("⚠️ You need at least 2 video files to merge. Please upload more videos first.")
         return
     
-    with st.expander("🔗 Merge Videos", expanded=True):
-        col1, col2 = st.columns([2, 1])
+    with st.expander("🔗 Merge Multiple Videos", expanded=True):
+        col1, col2 = st.columns([3, 2])
         
         with col1:
+            st.write("**Select Videos to Merge:**")
             # Select videos to merge
             selected_videos = st.multiselect(
-                "Select videos to merge (in order)",
+                "Choose videos (they will be merged in the order selected)",
                 video_files,
-                help="Videos will be merged in the order selected"
+                help="Select at least 2 videos. The order matters - first selected will be first in the merged video."
             )
             
             if len(selected_videos) >= 2:
-                st.info(f"📹 Selected {len(selected_videos)} videos for merging")
+                st.success(f"✅ Selected {len(selected_videos)} videos for merging")
                 
-                # Show selected videos info
+                # Show preview of selected videos
+                st.write("**Preview of selected videos:**")
                 total_duration = 0
                 total_size = 0
                 
@@ -406,34 +413,45 @@ def show_video_merge_section():
                     if info:
                         total_duration += info['duration']
                         total_size += info['size']
-                        st.text(f"{i}. {os.path.basename(video)} - {format_duration(info['duration'])} - {format_file_size(info['size'])}")
+                        st.text(f"{i}. {os.path.basename(video)} - Duration: {format_duration(info['duration'])} - Size: {format_file_size(info['size'])}")
+                    else:
+                        st.text(f"{i}. {os.path.basename(video)} - Could not read info")
                 
-                st.info(f"📊 Total Duration: {format_duration(total_duration)} | Total Size: {format_file_size(total_size)}")
+                st.info(f"📊 **Total Duration:** {format_duration(total_duration)} | **Total Size:** {format_file_size(total_size)}")
+            
+            elif len(selected_videos) == 1:
+                st.info("Please select at least one more video to merge.")
         
         with col2:
-            # Merge settings
-            merge_type = st.selectbox(
+            st.write("**Merge Settings:**")
+            
+            # Merge method selection
+            merge_method = st.selectbox(
                 "Merge Method",
-                ["Auto", "Fast Copy", "Re-encode"],
-                help="Auto: Automatic selection, Fast Copy: Same format only, Re-encode: Different formats"
+                ["Auto (Recommended)", "Fast Copy", "Re-encode"],
+                help="Auto: Tries fast copy first, falls back to re-encode if needed\nFast Copy: Quick but only works with same format videos\nRe-encode: Slower but works with any video formats"
             )
             
+            # Output filename
+            default_name = f"merged_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
             output_name = st.text_input(
-                "Output filename",
-                value=f"merged_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
-                help="Name for the merged video file"
+                "Output Filename",
+                value=default_name,
+                help="Name for the merged video file (will be saved in current directory)"
             )
             
             # Quality settings for re-encode
-            if merge_type == "Re-encode":
+            if merge_method == "Re-encode":
                 quality = st.selectbox(
                     "Output Quality",
-                    ["High", "Medium", "Low"],
-                    index=1
+                    ["High (CRF 18)", "Medium (CRF 23)", "Low (CRF 28)"],
+                    index=1,
+                    help="Higher quality = larger file size"
                 )
     
     # Merge controls
-    col1, col2, col3 = st.columns(3)
+    st.write("**Merge Controls:**")
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         merge_disabled = (len(selected_videos) < 2 or 
@@ -442,62 +460,125 @@ def show_video_merge_section():
         
         if st.button("🔗 Start Merge", disabled=merge_disabled, type="primary"):
             if not check_ffmpeg():
-                st.error("FFmpeg not found. Please install FFmpeg first.")
+                st.error("❌ FFmpeg not found. Please install FFmpeg first.")
+                return
+            
+            # Check if output file already exists
+            if os.path.exists(output_name):
+                st.warning(f"⚠️ File '{output_name}' already exists. Please choose a different name.")
                 return
             
             st.session_state.merge_active = True
             
-            with st.spinner("🔄 Merging videos... This may take a while."):
-                try:
-                    # Determine merge method
-                    if merge_type == "Fast Copy" or merge_type == "Auto":
-                        success, message = merge_videos_concat(selected_videos, output_name)
-                        if not success and merge_type == "Auto":
-                            # Fallback to re-encode
-                            st.info("Fast copy failed, trying re-encode method...")
-                            success, message = merge_videos_filter(selected_videos, output_name)
-                    else:
-                        success, message = merge_videos_filter(selected_videos, output_name)
-                    
-                    if success:
-                        st.success(f"✅ {message}")
-                        st.success(f"📁 Output saved as: {output_name}")
-                        
-                        # Add to uploaded files list
-                        if output_name not in st.session_state.uploaded_files:
-                            st.session_state.uploaded_files.append(output_name)
-                        
-                        # Show output file info
-                        info = get_video_info(output_name)
-                        if info:
-                            st.info(f"📊 Merged video: {format_duration(info['duration'])} | {format_file_size(info['size'])}")
-                    else:
-                        st.error(f"❌ {message}")
-                        
-                except Exception as e:
-                    st.error(f"❌ Unexpected error: {str(e)}")
-                    save_merge_history(output_name, selected_videos, merge_type.lower(), 'failed', 0, 0, str(e))
+            # Show progress
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            try:
+                status_text.text("🔄 Starting merge process...")
+                progress_bar.progress(10)
                 
-                finally:
-                    st.session_state.merge_active = False
+                # Determine merge method
+                success = False
+                message = ""
+                
+                if merge_method == "Fast Copy":
+                    status_text.text("🚀 Using fast copy method...")
+                    progress_bar.progress(30)
+                    success, message = merge_videos_concat(selected_videos, output_name)
+                    
+                elif merge_method == "Re-encode":
+                    status_text.text("🔄 Using re-encode method (this may take a while)...")
+                    progress_bar.progress(30)
+                    success, message = merge_videos_filter(selected_videos, output_name)
+                    
+                else:  # Auto method
+                    status_text.text("🚀 Trying fast copy method first...")
+                    progress_bar.progress(20)
+                    success, message = merge_videos_concat(selected_videos, output_name)
+                    
+                    if not success:
+                        status_text.text("🔄 Fast copy failed, trying re-encode method...")
+                        progress_bar.progress(50)
+                        success, message = merge_videos_filter(selected_videos, output_name)
+                
+                progress_bar.progress(90)
+                
+                if success:
+                    progress_bar.progress(100)
+                    status_text.text("✅ Merge completed successfully!")
+                    st.success(f"🎉 {message}")
+                    st.success(f"📁 Output saved as: **{output_name}**")
+                    
+                    # Add to uploaded files list if not already there
+                    if output_name not in st.session_state.uploaded_files:
+                        st.session_state.uploaded_files.append(output_name)
+                    
+                    # Show output file info
+                    info = get_video_info(output_name)
+                    if info:
+                        st.info(f"📊 **Merged Video Info:** Duration: {format_duration(info['duration'])} | Size: {format_file_size(info['size'])} | Resolution: {info['video_width']}x{info['video_height']}")
+                    
+                    # Auto-refresh to show new file
+                    time.sleep(2)
                     st.rerun()
+                    
+                else:
+                    progress_bar.progress(0)
+                    status_text.text("❌ Merge failed!")
+                    st.error(f"❌ {message}")
+                    
+            except Exception as e:
+                progress_bar.progress(0)
+                status_text.text("❌ Unexpected error occurred!")
+                st.error(f"❌ Unexpected error: {str(e)}")
+                save_merge_history(output_name, selected_videos, merge_method.lower(), 'failed', 0, 0, str(e))
+            
+            finally:
+                st.session_state.merge_active = False
     
     with col2:
-        if st.button("🗑️ Clear Selection"):
+        if st.button("🔄 Refresh List"):
             st.rerun()
     
     with col3:
+        if st.button("🗑️ Clear Selection"):
+            st.rerun()
+    
+    with col4:
         # Status indicator
         if st.session_state.merge_active:
             st.warning("🔄 MERGING")
         else:
-            st.info("⚫ READY")
-    
-    # Merge history
+            st.success("✅ READY")
+
+def show_merge_history():
+    """Show merge history section"""
     st.subheader("📋 Merge History")
+    
     merge_history = get_merge_history()
     
     if not merge_history.empty:
+        # Summary stats
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            total_merges = len(merge_history)
+            st.metric("Total Merges", total_merges)
+        
+        with col2:
+            successful_merges = len(merge_history[merge_history['status'] == 'success'])
+            success_rate = (successful_merges / total_merges * 100) if total_merges > 0 else 0
+            st.metric("Success Rate", f"{success_rate:.1f}%")
+        
+        with col3:
+            total_duration = merge_history['duration'].fillna(0).sum()
+            st.metric("Total Time", f"{total_duration:.1f}s")
+        
+        with col4:
+            total_size = merge_history['file_size'].fillna(0).sum()
+            st.metric("Total Output Size", format_file_size(total_size))
+        
         # Format history for display
         display_history = merge_history.copy()
         display_history['created_at'] = pd.to_datetime(display_history['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -506,7 +587,7 @@ def show_video_merge_section():
         display_history['input_count'] = display_history['input_files'].apply(lambda x: len(json.loads(x)) if x else 0)
         
         # Select columns to show
-        columns_to_show = ['created_at', 'output_file', 'input_count', 'merge_type', 'status', 'duration', 'file_size']
+        columns_to_show = ['created_at', 'output_file', 'input_count', 'merge_method', 'status', 'duration', 'file_size']
         display_history = display_history[columns_to_show]
         display_history.columns = ['Date', 'Output File', 'Input Count', 'Method', 'Status', 'Duration', 'Size']
         
@@ -515,8 +596,31 @@ def show_video_merge_section():
             use_container_width=True,
             hide_index=True
         )
+        
+        # Export merge history
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📊 Export Merge History to CSV"):
+                csv = merge_history.to_csv(index=False)
+                st.download_button(
+                    label="💾 Download CSV",
+                    data=csv,
+                    file_name=f"merge_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+        
+        with col2:
+            if st.button("🗑️ Clear Merge History"):
+                if st.button("⚠️ Confirm Clear History"):
+                    conn = sqlite3.connect('streaming_app.db')
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM merge_history")
+                    conn.commit()
+                    conn.close()
+                    st.success("✅ Merge history cleared!")
+                    st.rerun()
     else:
-        st.info("No merge history available yet.")
+        st.info("📝 No merge history available yet. Start merging videos to see history here.")
 
 def get_app_setting(key, default_value):
     """Get application setting from database"""
@@ -985,8 +1089,11 @@ def show_file_manager():
         
         st.success(f"✅ Uploaded {len(uploaded_files)} file(s)")
     
-    # Video merge section
+    # Video merge section - ADD THIS HERE
     show_video_merge_section()
+    
+    # Merge history section
+    show_merge_history()
     
     # Video files list
     st.subheader("🎬 Video Files")
