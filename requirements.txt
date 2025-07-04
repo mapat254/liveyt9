@@ -1,4 +1,15 @@
 streamlit
+pandas
+psutil
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+requests
+ffmpeg
+opencv-python-headless
+pillow
+numpy
 ffmpeg-python
 pytube
-playwright>=1.43.0
+pytz
