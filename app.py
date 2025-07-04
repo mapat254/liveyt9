@@ -11,8 +11,6 @@ import pandas as pd
 from pathlib import Path
 import queue
 import signal
-import tempfile
-import shutil
 
 # Install required packages
 try:
@@ -20,216 +18,6 @@ try:
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "streamlit", "pandas"])
     import streamlit as st
-
-class VideoMerger:
-    def __init__(self, db):
-        self.db = db
-        self.temp_dir = tempfile.mkdtemp(prefix="video_merger_")
-        
-    def get_video_info(self, video_path):
-        """Get video information using FFprobe"""
-        try:
-            cmd = [
-                "ffprobe", "-v", "quiet", "-print_format", "json", 
-                "-show_format", "-show_streams", video_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                info = json.loads(result.stdout)
-                
-                # Extract video stream info
-                video_stream = next((s for s in info['streams'] if s['codec_type'] == 'video'), None)
-                audio_stream = next((s for s in info['streams'] if s['codec_type'] == 'audio'), None)
-                
-                return {
-                    'duration': float(info['format'].get('duration', 0)),
-                    'size': int(info['format'].get('size', 0)),
-                    'width': int(video_stream.get('width', 0)) if video_stream else 0,
-                    'height': int(video_stream.get('height', 0)) if video_stream else 0,
-                    'fps': eval(video_stream.get('r_frame_rate', '0/1')) if video_stream else 0,
-                    'video_codec': video_stream.get('codec_name', 'unknown') if video_stream else 'none',
-                    'audio_codec': audio_stream.get('codec_name', 'unknown') if audio_stream else 'none',
-                    'bitrate': int(info['format'].get('bit_rate', 0))
-                }
-        except Exception as e:
-            self.db.save_log(f"Error getting video info: {e}", 'ERROR')
-            return None
-    
-    def create_file_list(self, video_files, output_path):
-        """Create file list for FFmpeg concat"""
-        list_file = os.path.join(self.temp_dir, "file_list.txt")
-        with open(list_file, 'w') as f:
-            for video_file in video_files:
-                # Escape single quotes and backslashes for FFmpeg
-                escaped_path = video_file.replace("'", "'\"'\"'").replace("\\", "/")
-                f.write(f"file '{escaped_path}'\n")
-        return list_file
-    
-    def merge_videos_concat(self, video_files, output_path, progress_callback=None):
-        """Merge videos using concat demuxer (fastest, same format)"""
-        try:
-            list_file = self.create_file_list(video_files, output_path)
-            
-            cmd = [
-                "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file,
-                "-c", "copy", "-y", output_path
-            ]
-            
-            self.db.save_log(f"Merging videos with concat: {len(video_files)} files")
-            
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
-                text=True, universal_newlines=True
-            )
-            
-            for line in process.stdout:
-                if progress_callback:
-                    progress_callback(line.strip())
-                self.db.save_log(line.strip(), 'DEBUG')
-            
-            process.wait()
-            
-            if process.returncode == 0:
-                self.db.save_log("Video merge completed successfully")
-                return True, "Videos merged successfully"
-            else:
-                return False, f"FFmpeg process failed with code {process.returncode}"
-                
-        except Exception as e:
-            error_msg = f"Error merging videos: {str(e)}"
-            self.db.save_log(error_msg, 'ERROR')
-            return False, error_msg
-    
-    def merge_videos_filter(self, video_files, output_path, resolution="1920x1080", fps=30, progress_callback=None):
-        """Merge videos using filter complex (re-encoding, different formats)"""
-        try:
-            # Build input parameters
-            inputs = []
-            filter_parts = []
-            
-            for i, video_file in enumerate(video_files):
-                inputs.extend(["-i", video_file])
-                filter_parts.append(f"[{i}:v]scale={resolution},setsar=1,fps={fps}[v{i}];")
-                filter_parts.append(f"[{i}:a]aresample=44100[a{i}];")
-            
-            # Concatenate all streams
-            video_concat = "".join([f"[v{i}]" for i in range(len(video_files))])
-            audio_concat = "".join([f"[a{i}]" for i in range(len(video_files))])
-            filter_parts.append(f"{video_concat}concat=n={len(video_files)}:v=1:a=0[outv];")
-            filter_parts.append(f"{audio_concat}concat=n={len(video_files)}:v=0:a=1[outa]")
-            
-            filter_complex = "".join(filter_parts)
-            
-            cmd = [
-                "ffmpeg"
-            ] + inputs + [
-                "-filter_complex", filter_complex,
-                "-map", "[outv]", "-map", "[outa]",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-y", output_path
-            ]
-            
-            self.db.save_log(f"Merging videos with re-encoding: {len(video_files)} files")
-            
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, universal_newlines=True
-            )
-            
-            for line in process.stdout:
-                if progress_callback:
-                    progress_callback(line.strip())
-                self.db.save_log(line.strip(), 'DEBUG')
-            
-            process.wait()
-            
-            if process.returncode == 0:
-                self.db.save_log("Video merge with re-encoding completed successfully")
-                return True, "Videos merged and re-encoded successfully"
-            else:
-                return False, f"FFmpeg process failed with code {process.returncode}"
-                
-        except Exception as e:
-            error_msg = f"Error merging videos with re-encoding: {str(e)}"
-            self.db.save_log(error_msg, 'ERROR')
-            return False, error_msg
-    
-    def add_transitions(self, video_files, output_path, transition_duration=1.0, transition_type="fade", progress_callback=None):
-        """Add transitions between videos"""
-        try:
-            if len(video_files) < 2:
-                return self.merge_videos_concat(video_files, output_path, progress_callback)
-            
-            # Build complex filter for transitions
-            inputs = []
-            filter_parts = []
-            
-            for i, video_file in enumerate(video_files):
-                inputs.extend(["-i", video_file])
-            
-            # Create transition effects
-            for i in range(len(video_files) - 1):
-                if transition_type == "fade":
-                    if i == 0:
-                        filter_parts.append(f"[0:v][1:v]xfade=transition=fade:duration={transition_duration}:offset=0[v01];")
-                    else:
-                        filter_parts.append(f"[v{i-1}{i}][{i+1}:v]xfade=transition=fade:duration={transition_duration}:offset=0[v{i}{i+1}];")
-                elif transition_type == "wipeleft":
-                    if i == 0:
-                        filter_parts.append(f"[0:v][1:v]xfade=transition=wipeleft:duration={transition_duration}:offset=0[v01];")
-                    else:
-                        filter_parts.append(f"[v{i-1}{i}][{i+1}:v]xfade=transition=wipeleft:duration={transition_duration}:offset=0[v{i}{i+1}];")
-            
-            # Audio concatenation
-            audio_inputs = "".join([f"[{i}:a]" for i in range(len(video_files))])
-            filter_parts.append(f"{audio_inputs}concat=n={len(video_files)}:v=0:a=1[outa]")
-            
-            filter_complex = "".join(filter_parts)
-            final_video = f"[v{len(video_files)-2}{len(video_files)-1}]" if len(video_files) > 2 else "[v01]"
-            
-            cmd = [
-                "ffmpeg"
-            ] + inputs + [
-                "-filter_complex", filter_complex,
-                "-map", final_video, "-map", "[outa]",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-y", output_path
-            ]
-            
-            self.db.save_log(f"Adding {transition_type} transitions between {len(video_files)} videos")
-            
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, universal_newlines=True
-            )
-            
-            for line in process.stdout:
-                if progress_callback:
-                    progress_callback(line.strip())
-                self.db.save_log(line.strip(), 'DEBUG')
-            
-            process.wait()
-            
-            if process.returncode == 0:
-                self.db.save_log("Video merge with transitions completed successfully")
-                return True, f"Videos merged with {transition_type} transitions successfully"
-            else:
-                return False, f"FFmpeg process failed with code {process.returncode}"
-                
-        except Exception as e:
-            error_msg = f"Error adding transitions: {str(e)}"
-            self.db.save_log(error_msg, 'ERROR')
-            return False, error_msg
-    
-    def cleanup(self):
-        """Clean up temporary files"""
-        try:
-            if os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir)
-        except Exception as e:
-            self.db.save_log(f"Error cleaning up temp files: {e}", 'ERROR')
 
 class StreamingDatabase:
     def __init__(self):
@@ -286,12 +74,14 @@ class StreamingDatabase:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS merged_videos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                output_path TEXT,
+                output_name TEXT UNIQUE,
                 source_files TEXT,
                 merge_type TEXT,
+                output_path TEXT,
+                duration REAL,
+                file_size INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                file_size INTEGER
+                status TEXT DEFAULT 'completed'
             )
         ''')
         
@@ -393,41 +183,29 @@ class StreamingDatabase:
         conn.commit()
         conn.close()
     
-    def save_merged_video(self, name, output_path, source_files, merge_type):
-        file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-        source_files_json = json.dumps(source_files)
-        
+    def save_merged_video(self, output_name, source_files, merge_type, output_path, duration=0, file_size=0):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO merged_videos 
-            (name, output_path, source_files, merge_type, file_size)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (name, output_path, source_files_json, merge_type, file_size))
+            INSERT OR REPLACE INTO merged_videos 
+            (output_name, source_files, merge_type, output_path, duration, file_size)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (output_name, json.dumps(source_files), merge_type, output_path, duration, file_size))
         conn.commit()
         conn.close()
     
     def get_merged_videos(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT * FROM merged_videos 
-            ORDER BY created_at DESC
-        ''')
+        cursor.execute('SELECT * FROM merged_videos ORDER BY created_at DESC')
         videos = cursor.fetchall()
         conn.close()
         return videos
     
-    def delete_merged_video(self, video_id):
+    def delete_merged_video(self, output_name):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('SELECT output_path FROM merged_videos WHERE id = ?', (video_id,))
-        result = cursor.fetchone()
-        
-        if result and os.path.exists(result[0]):
-            os.remove(result[0])
-        
-        cursor.execute('DELETE FROM merged_videos WHERE id = ?', (video_id,))
+        cursor.execute('DELETE FROM merged_videos WHERE output_name = ?', (output_name,))
         conn.commit()
         conn.close()
 
@@ -607,6 +385,432 @@ class StreamingProcess:
                 break
         return stats
 
+class VideoMerger:
+    def __init__(self, db):
+        self.db = db
+        self.is_merging = False
+        self.merge_process = None
+        self.progress_queue = queue.Queue()
+        self.log_queue = queue.Queue()
+        self.current_progress = 0
+        self.merge_status = "idle"
+    
+    def log_message(self, message, log_type='INFO'):
+        """Thread-safe logging for video merger"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        self.db.save_log(log_entry, log_type)
+        self.log_queue.put(log_entry)
+    
+    def update_progress(self, progress, status="processing"):
+        """Thread-safe progress update"""
+        self.current_progress = progress
+        self.merge_status = status
+        self.progress_queue.put({'progress': progress, 'status': status})
+    
+    def get_video_info(self, video_path):
+        """Get video information using ffprobe"""
+        try:
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json', 
+                '-show_format', '-show_streams', video_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                info = json.loads(result.stdout)
+                
+                video_stream = None
+                audio_stream = None
+                
+                for stream in info.get('streams', []):
+                    if stream.get('codec_type') == 'video' and not video_stream:
+                        video_stream = stream
+                    elif stream.get('codec_type') == 'audio' and not audio_stream:
+                        audio_stream = stream
+                
+                format_info = info.get('format', {})
+                
+                return {
+                    'duration': float(format_info.get('duration', 0)),
+                    'size': int(format_info.get('size', 0)),
+                    'bitrate': int(format_info.get('bit_rate', 0)),
+                    'video': {
+                        'codec': video_stream.get('codec_name', 'unknown') if video_stream else 'none',
+                        'width': int(video_stream.get('width', 0)) if video_stream else 0,
+                        'height': int(video_stream.get('height', 0)) if video_stream else 0,
+                        'fps': eval(video_stream.get('r_frame_rate', '0/1')) if video_stream else 0,
+                        'bitrate': int(video_stream.get('bit_rate', 0)) if video_stream else 0
+                    },
+                    'audio': {
+                        'codec': audio_stream.get('codec_name', 'unknown') if audio_stream else 'none',
+                        'sample_rate': int(audio_stream.get('sample_rate', 0)) if audio_stream else 0,
+                        'channels': int(audio_stream.get('channels', 0)) if audio_stream else 0,
+                        'bitrate': int(audio_stream.get('bit_rate', 0)) if audio_stream else 0
+                    }
+                }
+            else:
+                return None
+                
+        except Exception as e:
+            self.log_message(f"Error getting video info for {video_path}: {e}", 'ERROR')
+            return None
+    
+    def merge_videos_concat(self, video_files, output_path):
+        """Fast concatenation for videos with same format"""
+        try:
+            # Create temporary file list
+            list_file = "temp_file_list.txt"
+            with open(list_file, 'w') as f:
+                for video_file in video_files:
+                    f.write(f"file '{video_file}'\n")
+            
+            cmd = [
+                'ffmpeg', '-f', 'concat', '-safe', '0', '-i', list_file,
+                '-c', 'copy', '-y', output_path
+            ]
+            
+            self.log_message(f"Merging videos with concat: {len(video_files)} files")
+            self.update_progress(10, "starting")
+            
+            self.merge_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                text=True, universal_newlines=True
+            )
+            
+            self.is_merging = True
+            
+            # Monitor progress
+            for line in self.merge_process.stdout:
+                if not self.is_merging:
+                    break
+                
+                if line.strip():
+                    self.log_message(line.strip(), 'DEBUG')
+                    
+                    # Parse progress from FFmpeg output
+                    if "time=" in line:
+                        try:
+                            time_part = line.split("time=")[1].split()[0]
+                            # Convert time to seconds for progress calculation
+                            time_parts = time_part.split(":")
+                            if len(time_parts) == 3:
+                                current_seconds = float(time_parts[0]) * 3600 + float(time_parts[1]) * 60 + float(time_parts[2])
+                                # Estimate total duration (rough calculation)
+                                total_duration = sum([self.get_video_info(vf)['duration'] for vf in video_files if self.get_video_info(vf)])
+                                if total_duration > 0:
+                                    progress = min(90, int((current_seconds / total_duration) * 80) + 10)
+                                    self.update_progress(progress, "processing")
+                        except:
+                            pass
+            
+            self.merge_process.wait()
+            
+            # Cleanup
+            if os.path.exists(list_file):
+                os.remove(list_file)
+            
+            if self.merge_process.returncode == 0:
+                self.update_progress(100, "completed")
+                self.log_message("Video merge completed successfully!")
+                return True
+            else:
+                self.update_progress(0, "failed")
+                self.log_message("Video merge failed!", 'ERROR')
+                return False
+                
+        except Exception as e:
+            self.log_message(f"Error merging videos: {str(e)}", 'ERROR')
+            self.update_progress(0, "failed")
+            return False
+        finally:
+            self.is_merging = False
+            if os.path.exists("temp_file_list.txt"):
+                os.remove("temp_file_list.txt")
+    
+    def merge_videos_reencode(self, video_files, output_path, resolution="1920x1080", fps=30, audio_bitrate=128):
+        """Re-encode and merge videos with different formats"""
+        try:
+            # Build complex filter for concatenation
+            filter_complex = ""
+            inputs = []
+            
+            for i, video_file in enumerate(video_files):
+                inputs.extend(["-i", video_file])
+                filter_complex += f"[{i}:v]scale={resolution},setsar=1[v{i}];"
+                filter_complex += f"[{i}:a]aresample=48000[a{i}];"
+            
+            # Concatenate all streams
+            v_inputs = "".join([f"[v{i}]" for i in range(len(video_files))])
+            a_inputs = "".join([f"[a{i}]" for i in range(len(video_files))])
+            filter_complex += f"{v_inputs}concat=n={len(video_files)}:v=1:a=0[outv];"
+            filter_complex += f"{a_inputs}concat=n={len(video_files)}:v=0:a=1[outa]"
+            
+            cmd = [
+                'ffmpeg'
+            ] + inputs + [
+                '-filter_complex', filter_complex,
+                '-map', '[outv]', '-map', '[outa]',
+                '-c:v', 'libx264', '-preset', 'medium',
+                '-crf', '23', '-r', str(fps),
+                '-c:a', 'aac', '-b:a', f'{audio_bitrate}k',
+                '-y', output_path
+            ]
+            
+            self.log_message(f"Re-encoding and merging {len(video_files)} videos")
+            self.update_progress(10, "starting")
+            
+            self.merge_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, universal_newlines=True
+            )
+            
+            self.is_merging = True
+            
+            # Monitor progress
+            for line in self.merge_process.stdout:
+                if not self.is_merging:
+                    break
+                
+                if line.strip():
+                    self.log_message(line.strip(), 'DEBUG')
+                    
+                    # Parse progress
+                    if "time=" in line:
+                        try:
+                            time_part = line.split("time=")[1].split()[0]
+                            time_parts = time_part.split(":")
+                            if len(time_parts) == 3:
+                                current_seconds = float(time_parts[0]) * 3600 + float(time_parts[1]) * 60 + float(time_parts[2])
+                                total_duration = sum([self.get_video_info(vf)['duration'] for vf in video_files if self.get_video_info(vf)])
+                                if total_duration > 0:
+                                    progress = min(90, int((current_seconds / total_duration) * 80) + 10)
+                                    self.update_progress(progress, "processing")
+                        except:
+                            pass
+            
+            self.merge_process.wait()
+            
+            if self.merge_process.returncode == 0:
+                self.update_progress(100, "completed")
+                self.log_message("Video re-encode and merge completed!")
+                return True
+            else:
+                self.update_progress(0, "failed")
+                self.log_message("Video re-encode and merge failed!", 'ERROR')
+                return False
+                
+        except Exception as e:
+            self.log_message(f"Error re-encoding videos: {str(e)}", 'ERROR')
+            self.update_progress(0, "failed")
+            return False
+        finally:
+            self.is_merging = False
+    
+    def merge_videos_with_transitions(self, video_files, output_path, transition_type="fade", transition_duration=1.0):
+        """Merge videos with transition effects"""
+        try:
+            if len(video_files) < 2:
+                self.log_message("Need at least 2 videos for transitions", 'ERROR')
+                return False
+            
+            # Build complex filter with transitions
+            filter_complex = ""
+            inputs = []
+            
+            for i, video_file in enumerate(video_files):
+                inputs.extend(["-i", video_file])
+            
+            # Create transition effects
+            current_output = "[0:v]"
+            for i in range(1, len(video_files)):
+                if transition_type == "fade":
+                    filter_complex += f"{current_output}[{i}:v]xfade=transition=fade:duration={transition_duration}:offset=0[v{i}];"
+                elif transition_type == "wipeleft":
+                    filter_complex += f"{current_output}[{i}:v]xfade=transition=wipeleft:duration={transition_duration}:offset=0[v{i}];"
+                elif transition_type == "wiperight":
+                    filter_complex += f"{current_output}[{i}:v]xfade=transition=wiperight:duration={transition_duration}:offset=0[v{i}];"
+                elif transition_type == "slideup":
+                    filter_complex += f"{current_output}[{i}:v]xfade=transition=slideup:duration={transition_duration}:offset=0[v{i}];"
+                elif transition_type == "slidedown":
+                    filter_complex += f"{current_output}[{i}:v]xfade=transition=slidedown:duration={transition_duration}:offset=0[v{i}];"
+                
+                current_output = f"[v{i}]"
+            
+            # Audio mixing
+            audio_inputs = "".join([f"[{i}:a]" for i in range(len(video_files))])
+            filter_complex += f"{audio_inputs}concat=n={len(video_files)}:v=0:a=1[outa]"
+            
+            cmd = [
+                'ffmpeg'
+            ] + inputs + [
+                '-filter_complex', filter_complex,
+                '-map', current_output, '-map', '[outa]',
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-y', output_path
+            ]
+            
+            self.log_message(f"Merging {len(video_files)} videos with {transition_type} transitions")
+            self.update_progress(10, "starting")
+            
+            self.merge_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, universal_newlines=True
+            )
+            
+            self.is_merging = True
+            
+            # Monitor progress
+            for line in self.merge_process.stdout:
+                if not self.is_merging:
+                    break
+                
+                if line.strip():
+                    self.log_message(line.strip(), 'DEBUG')
+                    
+                    if "time=" in line:
+                        try:
+                            time_part = line.split("time=")[1].split()[0]
+                            time_parts = time_part.split(":")
+                            if len(time_parts) == 3:
+                                current_seconds = float(time_parts[0]) * 3600 + float(time_parts[1]) * 60 + float(time_parts[2])
+                                total_duration = sum([self.get_video_info(vf)['duration'] for vf in video_files if self.get_video_info(vf)])
+                                if total_duration > 0:
+                                    progress = min(90, int((current_seconds / total_duration) * 80) + 10)
+                                    self.update_progress(progress, "processing")
+                        except:
+                            pass
+            
+            self.merge_process.wait()
+            
+            if self.merge_process.returncode == 0:
+                self.update_progress(100, "completed")
+                self.log_message("Video merge with transitions completed!")
+                return True
+            else:
+                self.update_progress(0, "failed")
+                self.log_message("Video merge with transitions failed!", 'ERROR')
+                return False
+                
+        except Exception as e:
+            self.log_message(f"Error merging videos with transitions: {str(e)}", 'ERROR')
+            self.update_progress(0, "failed")
+            return False
+        finally:
+            self.is_merging = False
+    
+    def start_merge(self, video_files, output_name, merge_type, **kwargs):
+        """Start video merging process"""
+        if self.is_merging:
+            return False, "Merge already in progress"
+        
+        if len(video_files) < 2:
+            return False, "Need at least 2 videos to merge"
+        
+        # Check if all files exist
+        for video_file in video_files:
+            if not os.path.exists(video_file):
+                return False, f"Video file not found: {video_file}"
+        
+        output_path = f"{output_name}.mp4"
+        
+        # Start merge in separate thread
+        def merge_thread():
+            try:
+                if merge_type == "concat":
+                    success = self.merge_videos_concat(video_files, output_path)
+                elif merge_type == "reencode":
+                    success = self.merge_videos_reencode(
+                        video_files, output_path,
+                        kwargs.get('resolution', '1920x1080'),
+                        kwargs.get('fps', 30),
+                        kwargs.get('audio_bitrate', 128)
+                    )
+                elif merge_type == "transitions":
+                    success = self.merge_videos_with_transitions(
+                        video_files, output_path,
+                        kwargs.get('transition_type', 'fade'),
+                        kwargs.get('transition_duration', 1.0)
+                    )
+                else:
+                    success = False
+                    self.log_message(f"Unknown merge type: {merge_type}", 'ERROR')
+                
+                if success and os.path.exists(output_path):
+                    # Get file info
+                    file_size = os.path.getsize(output_path)
+                    video_info = self.get_video_info(output_path)
+                    duration = video_info['duration'] if video_info else 0
+                    
+                    # Save to database
+                    self.db.save_merged_video(
+                        output_name, video_files, merge_type, 
+                        output_path, duration, file_size
+                    )
+                    
+                    self.log_message(f"Merge completed: {output_path}")
+                else:
+                    self.log_message("Merge failed or output file not created", 'ERROR')
+                    
+            except Exception as e:
+                self.log_message(f"Error in merge thread: {str(e)}", 'ERROR')
+                self.update_progress(0, "failed")
+        
+        thread = threading.Thread(target=merge_thread, daemon=True)
+        thread.start()
+        
+        return True, "Merge started successfully"
+    
+    def stop_merge(self):
+        """Stop current merge process"""
+        if not self.is_merging:
+            return False, "No merge in progress"
+        
+        self.is_merging = False
+        
+        try:
+            if self.merge_process:
+                if os.name == 'nt':  # Windows
+                    self.merge_process.terminate()
+                else:  # Unix/Linux
+                    os.killpg(os.getpgid(self.merge_process.pid), signal.SIGTERM)
+                
+                try:
+                    self.merge_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    if os.name == 'nt':
+                        self.merge_process.kill()
+                    else:
+                        os.killpg(os.getpgid(self.merge_process.pid), signal.SIGKILL)
+        except Exception as e:
+            self.log_message(f"Error stopping merge: {e}", 'ERROR')
+        
+        self.update_progress(0, "cancelled")
+        self.log_message("Merge cancelled by user")
+        return True, "Merge stopped successfully"
+    
+    def get_new_logs(self):
+        """Get new log messages"""
+        logs = []
+        while not self.log_queue.empty():
+            try:
+                logs.append(self.log_queue.get_nowait())
+            except queue.Empty:
+                break
+        return logs
+    
+    def get_progress_update(self):
+        """Get latest progress update"""
+        update = None
+        while not self.progress_queue.empty():
+            try:
+                update = self.progress_queue.get_nowait()
+            except queue.Empty:
+                break
+        return update
+
 class AdvancedStreamer:
     def __init__(self):
         self.db = StreamingDatabase()
@@ -635,10 +839,16 @@ class AdvancedStreamer:
             }
         if 'last_update' not in st.session_state:
             st.session_state['last_update'] = time.time()
+        
+        # Video merger session state
+        if 'merge_active' not in st.session_state:
+            st.session_state['merge_active'] = False
         if 'merge_progress' not in st.session_state:
-            st.session_state['merge_progress'] = []
-        if 'merge_in_progress' not in st.session_state:
-            st.session_state['merge_in_progress'] = False
+            st.session_state['merge_progress'] = 0
+        if 'merge_status' not in st.session_state:
+            st.session_state['merge_status'] = "idle"
+        if 'merge_logs' not in st.session_state:
+            st.session_state['merge_logs'] = []
     
     def update_from_process(self):
         """Update session state from streaming process"""
@@ -657,6 +867,25 @@ class AdvancedStreamer:
         
         # Update streaming status
         st.session_state['streaming_active'] = self.streaming_process.is_running
+    
+    def update_from_merger(self):
+        """Update session state from video merger"""
+        # Get new merge logs
+        new_logs = self.video_merger.get_new_logs()
+        if new_logs:
+            st.session_state['merge_logs'].extend(new_logs)
+            # Keep only last 50 logs
+            if len(st.session_state['merge_logs']) > 50:
+                st.session_state['merge_logs'] = st.session_state['merge_logs'][-50:]
+        
+        # Get progress update
+        progress_update = self.video_merger.get_progress_update()
+        if progress_update:
+            st.session_state['merge_progress'] = progress_update['progress']
+            st.session_state['merge_status'] = progress_update['status']
+        
+        # Update merge status
+        st.session_state['merge_active'] = self.video_merger.is_merging
     
     def start_streaming(self, config):
         """Start streaming"""
@@ -702,7 +931,7 @@ class AdvancedStreamer:
 
 def main():
     st.set_page_config(
-        page_title="🚀 Advanced YouTube Live Streamer Pro",
+        page_title="🚀 Advanced YouTube Live Streamer",
         page_icon="🎥",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -714,8 +943,9 @@ def main():
     
     streamer = st.session_state['streamer']
     
-    # Update from streaming process
+    # Update from streaming process and merger
     streamer.update_from_process()
+    streamer.update_from_merger()
     
     # Custom CSS for better UI
     st.markdown("""
@@ -753,6 +983,15 @@ def main():
         text-align: center;
         font-weight: bold;
     }
+    .status-merging {
+        background-color: #fff3cd;
+        color: #856404;
+        padding: 0.5rem;
+        border-radius: 5px;
+        border: 1px solid #ffeaa7;
+        text-align: center;
+        font-weight: bold;
+    }
     .log-container {
         background-color: #f8f9fa;
         border: 1px solid #dee2e6;
@@ -763,21 +1002,23 @@ def main():
         font-family: monospace;
         font-size: 12px;
     }
-    .video-info-card {
-        background: #f8f9fa;
-        border: 1px solid #dee2e6;
-        border-radius: 8px;
-        padding: 1rem;
-        margin: 0.5rem 0;
+    .progress-bar {
+        background-color: #e9ecef;
+        border-radius: 10px;
+        overflow: hidden;
+        height: 20px;
+        margin: 10px 0;
     }
-    .merge-progress {
-        background: #e3f2fd;
-        border: 1px solid #2196f3;
-        border-radius: 5px;
-        padding: 0.5rem;
-        margin: 0.25rem 0;
-        font-family: monospace;
-        font-size: 11px;
+    .progress-fill {
+        background: linear-gradient(90deg, #28a745 0%, #20c997 100%);
+        height: 100%;
+        transition: width 0.3s ease;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+        font-size: 12px;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -786,7 +1027,7 @@ def main():
     st.markdown("""
     <div class="main-header">
         <h1>🚀 Advanced YouTube Live Streamer Pro</h1>
-        <p>Professional live streaming solution with video merger and advanced features</p>
+        <p>Professional live streaming solution with video merger</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -809,13 +1050,14 @@ def main():
             st.markdown('<div class="status-inactive">⭕ OFFLINE</div>', unsafe_allow_html=True)
         
         # Merge status indicator
-        if st.session_state.get('merge_in_progress', False):
-            st.markdown('<div class="status-active">🔄 MERGING VIDEOS</div>', unsafe_allow_html=True)
+        if st.session_state['merge_active']:
+            st.markdown('<div class="status-merging">🎬 MERGING VIDEO</div>', unsafe_allow_html=True)
+            st.write(f"📊 Progress: {st.session_state['merge_progress']}%")
         
         # Auto-refresh toggle
         auto_refresh = st.checkbox("🔄 Auto Refresh (5s)", value=True)
         
-        if auto_refresh and (st.session_state['streaming_active'] or st.session_state.get('merge_in_progress', False)):
+        if auto_refresh and (st.session_state['streaming_active'] or st.session_state['merge_active']):
             time.sleep(5)
             st.rerun()
     
@@ -834,12 +1076,12 @@ def main():
         show_settings(streamer)
 
 def show_video_merger(streamer):
-    st.header("🎬 Video Merger & Editor")
+    st.header("🎬 Video Merger")
     
-    tab1, tab2, tab3 = st.tabs(["🔧 Merge Videos", "📋 Merged Videos", "ℹ️ Video Info"])
+    tab1, tab2, tab3 = st.tabs(["🔧 Merge Videos", "📁 Merged Videos", "📊 Video Info"])
     
     with tab1:
-        st.subheader("🎬 Create Merged Video")
+        st.subheader("🔧 Video Merger")
         
         # Get available video files
         video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.mov', '.avi', '.mkv', '.webm'))]
@@ -853,288 +1095,287 @@ def show_video_merger(streamer):
         selected_videos = st.multiselect(
             "Choose videos (order matters for merging):",
             video_files,
-            help="Select videos in the order you want them to appear in the final merged video"
+            help="Select at least 2 videos. The order you select will be the order in the final video."
         )
         
-        if len(selected_videos) < 2:
-            st.info("🔢 Please select at least 2 videos to merge")
-            return
-        
-        # Show selected videos info
-        st.subheader("📊 Selected Videos Information")
-        total_duration = 0
-        total_size = 0
-        
-        for i, video in enumerate(selected_videos):
-            video_info = streamer.video_merger.get_video_info(video)
-            if video_info:
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.markdown(f"""
-                    <div class="video-info-card">
-                        <strong>{i+1}. {video}</strong><br>
-                        📐 Resolution: {video_info['width']}x{video_info['height']}<br>
-                        ⏱️ Duration: {video_info['duration']:.1f}s<br>
-                        📊 FPS: {video_info['fps']:.1f}<br>
-                        🎥 Video: {video_info['video_codec']} | 🔊 Audio: {video_info['audio_codec']}<br>
-                        💾 Size: {video_info['size']/(1024*1024):.1f} MB
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                total_duration += video_info['duration']
-                total_size += video_info['size']
-                
-                with col2:
-                    if st.button(f"🎥 Preview", key=f"preview_merge_{i}"):
-                        st.video(video)
-        
-        # Summary
-        st.info(f"📊 Total: {len(selected_videos)} videos, {total_duration:.1f}s duration, {total_size/(1024*1024):.1f} MB")
-        
-        # Merge configuration
-        st.subheader("⚙️ Merge Configuration")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            merge_name = st.text_input(
-                "📝 Output Name",
-                value=f"merged_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                help="Name for the merged video file"
-            )
+        if len(selected_videos) >= 2:
+            # Show selected videos info
+            st.subheader("📋 Selected Videos")
+            total_duration = 0
+            total_size = 0
             
-            merge_type = st.selectbox(
-                "🔧 Merge Method",
-                ["concat", "re-encode", "transitions"],
-                format_func=lambda x: {
-                    "concat": "🚀 Fast Concat (same format)",
-                    "re-encode": "🎨 Re-encode (different formats)",
-                    "transitions": "✨ With Transitions"
-                }[x],
-                help="Choose merge method based on your needs"
-            )
-        
-        with col2:
-            if merge_type == "re-encode":
-                output_resolution = st.selectbox(
-                    "📺 Output Resolution",
-                    ["1920x1080", "1280x720", "854x480", "720x1280"],
-                    help="Resolution for the merged video"
+            for i, video in enumerate(selected_videos):
+                with st.expander(f"📹 {i+1}. {video}"):
+                    info = streamer.video_merger.get_video_info(video)
+                    if info:
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write(f"**Duration:** {info['duration']:.2f} seconds")
+                            st.write(f"**Size:** {info['size'] / (1024*1024):.2f} MB")
+                            st.write(f"**Resolution:** {info['video']['width']}x{info['video']['height']}")
+                        with col2:
+                            st.write(f"**Video Codec:** {info['video']['codec']}")
+                            st.write(f"**Audio Codec:** {info['audio']['codec']}")
+                            st.write(f"**FPS:** {info['video']['fps']:.2f}")
+                        
+                        total_duration += info['duration']
+                        total_size += info['size']
+                    else:
+                        st.error(f"Could not read video info for {video}")
+            
+            # Summary
+            st.info(f"📊 **Total Duration:** {total_duration:.2f} seconds | **Total Size:** {total_size / (1024*1024):.2f} MB")
+            
+            # Merge configuration
+            st.subheader("⚙️ Merge Configuration")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                output_name = st.text_input(
+                    "📝 Output Name",
+                    value=f"merged_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    help="Name for the merged video (without extension)"
                 )
                 
-                output_fps = st.slider(
-                    "🎬 Output FPS",
-                    min_value=15,
-                    max_value=60,
-                    value=30,
-                    help="Frame rate for the merged video"
+                merge_type = st.selectbox(
+                    "🔧 Merge Method",
+                    ["concat", "reencode", "transitions"],
+                    format_func=lambda x: {
+                        "concat": "🚀 Fast Concat (same format)",
+                        "reencode": "🎨 Re-encode (different formats)",
+                        "transitions": "✨ With Transitions"
+                    }[x],
+                    help="Choose merge method based on your video formats"
                 )
             
-            elif merge_type == "transitions":
-                transition_type = st.selectbox(
-                    "✨ Transition Type",
-                    ["fade", "wipeleft", "wiperight", "slideup", "slidedown"],
-                    help="Type of transition between videos"
-                )
+            with col2:
+                if merge_type == "reencode":
+                    resolution = st.selectbox(
+                        "📺 Output Resolution",
+                        ["1920x1080", "1280x720", "854x480", "640x360"],
+                        help="Resolution for the output video"
+                    )
+                    
+                    fps = st.slider("🎬 Output FPS", 15, 60, 30, 5)
+                    audio_bitrate = st.slider("🔊 Audio Bitrate (kbps)", 64, 320, 128, 32)
                 
-                transition_duration = st.slider(
-                    "⏱️ Transition Duration (seconds)",
-                    min_value=0.5,
-                    max_value=3.0,
-                    value=1.0,
-                    step=0.1,
-                    help="Duration of each transition"
-                )
-        
-        # Advanced options
-        with st.expander("🔧 Advanced Options"):
-            output_format = st.selectbox(
-                "📁 Output Format",
-                ["mp4", "mkv", "avi"],
-                help="Output video format"
-            )
+                elif merge_type == "transitions":
+                    transition_type = st.selectbox(
+                        "✨ Transition Type",
+                        ["fade", "wipeleft", "wiperight", "slideup", "slidedown"],
+                        format_func=lambda x: {
+                            "fade": "🌅 Fade",
+                            "wipeleft": "⬅️ Wipe Left",
+                            "wiperight": "➡️ Wipe Right",
+                            "slideup": "⬆️ Slide Up",
+                            "slidedown": "⬇️ Slide Down"
+                        }[x]
+                    )
+                    
+                    transition_duration = st.slider("⏱️ Transition Duration (seconds)", 0.5, 3.0, 1.0, 0.1)
             
-            if merge_type != "concat":
-                video_quality = st.selectbox(
-                    "🎨 Video Quality",
-                    ["high", "medium", "low"],
-                    index=1,
-                    help="Higher quality = larger file size"
-                )
-                
-                audio_bitrate = st.selectbox(
-                    "🔊 Audio Bitrate",
-                    ["128k", "192k", "256k", "320k"],
-                    index=1,
-                    help="Audio quality"
-                )
-        
-        # Merge button and progress
-        if not st.session_state.get('merge_in_progress', False):
-            if st.button("🚀 Start Merging", type="primary", use_container_width=True):
-                if len(selected_videos) >= 2 and merge_name:
-                    st.session_state['merge_in_progress'] = True
-                    st.session_state['merge_progress'] = []
-                    
-                    output_path = f"{merge_name}.{output_format}"
-                    
-                    # Progress callback
-                    def progress_callback(message):
-                        st.session_state['merge_progress'].append(message)
-                    
-                    # Start merge in thread
-                    def merge_thread():
-                        try:
-                            if merge_type == "concat":
-                                success, message = streamer.video_merger.merge_videos_concat(
-                                    selected_videos, output_path, progress_callback
-                                )
-                            elif merge_type == "re-encode":
-                                success, message = streamer.video_merger.merge_videos_filter(
-                                    selected_videos, output_path, output_resolution, output_fps, progress_callback
-                                )
+            # Merge controls
+            st.subheader("🎮 Merge Controls")
+            
+            col_btn1, col_btn2 = st.columns(2)
+            
+            with col_btn1:
+                if not st.session_state['merge_active']:
+                    if st.button("🚀 Start Merging", type="primary", use_container_width=True):
+                        if not output_name:
+                            st.error("❌ Please enter an output name!")
+                        else:
+                            kwargs = {}
+                            if merge_type == "reencode":
+                                kwargs = {
+                                    'resolution': resolution,
+                                    'fps': fps,
+                                    'audio_bitrate': audio_bitrate
+                                }
                             elif merge_type == "transitions":
-                                success, message = streamer.video_merger.add_transitions(
-                                    selected_videos, output_path, transition_duration, transition_type, progress_callback
-                                )
+                                kwargs = {
+                                    'transition_type': transition_type,
+                                    'transition_duration': transition_duration
+                                }
+                            
+                            success, message = streamer.video_merger.start_merge(
+                                selected_videos, output_name, merge_type, **kwargs
+                            )
                             
                             if success:
-                                # Save to database
-                                streamer.db.save_merged_video(merge_name, output_path, selected_videos, merge_type)
-                                st.session_state['merge_success'] = True
-                                st.session_state['merge_message'] = message
+                                st.success(message)
+                                st.rerun()
                             else:
-                                st.session_state['merge_success'] = False
-                                st.session_state['merge_message'] = message
-                        
-                        except Exception as e:
-                            st.session_state['merge_success'] = False
-                            st.session_state['merge_message'] = f"Error: {str(e)}"
-                        
-                        finally:
-                            st.session_state['merge_in_progress'] = False
-                    
-                    thread = threading.Thread(target=merge_thread, daemon=True)
-                    thread.start()
-                    
-                    st.success("🚀 Merge started! Check progress below.")
-                    st.rerun()
+                                st.error(message)
                 else:
-                    st.error("❌ Please select videos and enter output name!")
+                    st.info("🎬 Merge in progress...")
+            
+            with col_btn2:
+                if st.session_state['merge_active']:
+                    if st.button("⏹️ Cancel Merge", type="secondary", use_container_width=True):
+                        success, message = streamer.video_merger.stop_merge()
+                        if success:
+                            st.warning(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+        
         else:
-            st.warning("🔄 Merge in progress... Please wait.")
-            
-            if st.button("⏹️ Cancel Merge"):
-                # Kill FFmpeg processes
-                try:
-                    if os.name == 'nt':
-                        os.system("taskkill /f /im ffmpeg.exe")
-                    else:
-                        os.system("pkill -9 -f ffmpeg")
-                    st.session_state['merge_in_progress'] = False
-                    st.warning("Merge cancelled!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error cancelling merge: {e}")
+            st.info("📋 Please select at least 2 videos to merge.")
         
-        # Show merge progress
-        if st.session_state.get('merge_progress'):
-            st.subheader("📋 Merge Progress")
-            progress_container = st.container()
-            with progress_container:
-                for log in st.session_state['merge_progress'][-10:]:  # Show last 10 logs
-                    st.markdown(f'<div class="merge-progress">{log}</div>', unsafe_allow_html=True)
-        
-        # Show merge result
-        if 'merge_success' in st.session_state:
-            if st.session_state['merge_success']:
-                st.success(f"✅ {st.session_state['merge_message']}")
-            else:
-                st.error(f"❌ {st.session_state['merge_message']}")
+        # Progress monitoring
+        if st.session_state['merge_active'] or st.session_state['merge_progress'] > 0:
+            st.subheader("📊 Merge Progress")
             
-            # Clear the result after showing
-            del st.session_state['merge_success']
-            del st.session_state['merge_message']
+            progress = st.session_state['merge_progress']
+            status = st.session_state['merge_status']
+            
+            # Progress bar
+            st.markdown(f"""
+            <div class="progress-bar">
+                <div class="progress-fill" style="width: {progress}%;">
+                    {progress}% - {status.title()}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Status info
+            status_colors = {
+                "idle": "🔵",
+                "starting": "🟡",
+                "processing": "🟠",
+                "completed": "🟢",
+                "failed": "🔴",
+                "cancelled": "⚫"
+            }
+            
+            st.write(f"{status_colors.get(status, '🔵')} **Status:** {status.title()}")
+            
+            # Merge logs
+            if st.session_state['merge_logs']:
+                with st.expander("📋 Merge Logs", expanded=False):
+                    logs_text = "\n".join(st.session_state['merge_logs'][-20:])  # Show last 20 logs
+                    st.markdown(f'<div class="log-container">{logs_text}</div>', unsafe_allow_html=True)
     
     with tab2:
-        st.subheader("📋 Previously Merged Videos")
+        st.subheader("📁 Merged Videos")
         
         merged_videos = streamer.db.get_merged_videos()
         
         if merged_videos:
             for video in merged_videos:
-                video_id, name, output_path, source_files_json, merge_type, created_at, file_size = video
-                source_files = json.loads(source_files_json)
-                
-                with st.expander(f"🎬 {name} ({created_at})"):
+                with st.expander(f"🎬 {video[1]} ({video[7]})"):
                     col1, col2, col3 = st.columns([2, 1, 1])
                     
                     with col1:
-                        st.write(f"**Output:** {output_path}")
-                        st.write(f"**Merge Type:** {merge_type}")
+                        source_files = json.loads(video[2]) if video[2] else []
                         st.write(f"**Source Files:** {len(source_files)} videos")
-                        st.write(f"**File Size:** {file_size/(1024*1024):.1f} MB")
+                        st.write(f"**Merge Type:** {video[3].title()}")
+                        st.write(f"**Duration:** {video[5]:.2f} seconds")
+                        st.write(f"**File Size:** {video[6] / (1024*1024):.2f} MB")
+                        st.write(f"**Output Path:** {video[4]}")
                         
                         # Show source files
-                        with st.expander("📁 Source Files"):
-                            for i, source_file in enumerate(source_files):
-                                st.write(f"{i+1}. {source_file}")
+                        if source_files:
+                            st.write("**Source Videos:**")
+                            for i, src_file in enumerate(source_files, 1):
+                                st.write(f"  {i}. {src_file}")
                     
                     with col2:
-                        if os.path.exists(output_path):
-                            if st.button(f"🎥 Preview", key=f"preview_merged_{video_id}"):
-                                st.video(output_path)
+                        if os.path.exists(video[4]):
+                            if st.button(f"📺 Use for Stream", key=f"use_merged_{video[0]}"):
+                                st.session_state['selected_merged_video'] = video[4]
+                                st.success(f"Selected '{video[1]}' for streaming!")
                             
-                            if st.button(f"📺 Use for Stream", key=f"use_merged_{video_id}"):
-                                st.session_state['selected_merged_video'] = output_path
-                                st.success(f"Selected {name} for streaming!")
+                            if st.button(f"🎥 Preview", key=f"preview_merged_{video[0]}"):
+                                st.video(video[4])
                         else:
-                            st.warning("File not found")
+                            st.error("❌ File not found")
                     
                     with col3:
-                        if st.button(f"🗑️ Delete", key=f"delete_merged_{video_id}"):
-                            streamer.db.delete_merged_video(video_id)
-                            st.success("Merged video deleted!")
-                            st.rerun()
+                        if st.button(f"🗑️ Delete", key=f"delete_merged_{video[0]}"):
+                            # Delete file and database record
+                            try:
+                                if os.path.exists(video[4]):
+                                    os.remove(video[4])
+                                streamer.db.delete_merged_video(video[1])
+                                st.success("Deleted successfully!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error deleting: {e}")
         else:
-            st.info("📁 No merged videos yet. Create one in the 'Merge Videos' tab.")
+            st.info("📁 No merged videos yet. Create some in the 'Merge Videos' tab!")
     
     with tab3:
-        st.subheader("ℹ️ Video Information Tool")
+        st.subheader("📊 Video Information Analyzer")
         
         video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.mov', '.avi', '.mkv', '.webm'))]
         
         if video_files:
-            selected_info_video = st.selectbox("Select video to analyze:", video_files)
+            selected_video = st.selectbox("📹 Select video to analyze:", video_files)
             
-            if selected_info_video:
-                video_info = streamer.video_merger.get_video_info(selected_info_video)
+            if selected_video:
+                info = streamer.video_merger.get_video_info(selected_video)
                 
-                if video_info:
+                if info:
                     col1, col2 = st.columns(2)
                     
                     with col1:
-                        st.metric("📐 Resolution", f"{video_info['width']}x{video_info['height']}")
-                        st.metric("⏱️ Duration", f"{video_info['duration']:.1f}s")
-                        st.metric("📊 Frame Rate", f"{video_info['fps']:.1f} FPS")
-                        st.metric("💾 File Size", f"{video_info['size']/(1024*1024):.1f} MB")
+                        st.subheader("📊 General Information")
+                        st.write(f"**File Name:** {selected_video}")
+                        st.write(f"**Duration:** {info['duration']:.2f} seconds ({info['duration']/60:.2f} minutes)")
+                        st.write(f"**File Size:** {info['size'] / (1024*1024):.2f} MB")
+                        st.write(f"**Overall Bitrate:** {info['bitrate'] / 1000:.2f} kbps")
+                        
+                        st.subheader("🎬 Video Information")
+                        st.write(f"**Codec:** {info['video']['codec']}")
+                        st.write(f"**Resolution:** {info['video']['width']}x{info['video']['height']}")
+                        st.write(f"**Frame Rate:** {info['video']['fps']:.2f} FPS")
+                        if info['video']['bitrate'] > 0:
+                            st.write(f"**Video Bitrate:** {info['video']['bitrate'] / 1000:.2f} kbps")
                     
                     with col2:
-                        st.metric("🎥 Video Codec", video_info['video_codec'])
-                        st.metric("🔊 Audio Codec", video_info['audio_codec'])
-                        st.metric("📡 Bitrate", f"{video_info['bitrate']} bps")
+                        st.subheader("🔊 Audio Information")
+                        st.write(f"**Codec:** {info['audio']['codec']}")
+                        st.write(f"**Sample Rate:** {info['audio']['sample_rate']} Hz")
+                        st.write(f"**Channels:** {info['audio']['channels']}")
+                        if info['audio']['bitrate'] > 0:
+                            st.write(f"**Audio Bitrate:** {info['audio']['bitrate'] / 1000:.2f} kbps")
                         
-                        # Calculate estimated streaming bitrate
-                        recommended_bitrate = min(video_info['bitrate'] // 1000, 6000)
-                        st.metric("💡 Recommended Stream Bitrate", f"{recommended_bitrate} kbps")
+                        st.subheader("📈 Compatibility")
+                        
+                        # Check format compatibility
+                        video_codec = info['video']['codec'].lower()
+                        audio_codec = info['audio']['codec'].lower()
+                        
+                        if video_codec in ['h264', 'avc']:
+                            st.success("✅ Video codec compatible for streaming")
+                        else:
+                            st.warning(f"⚠️ Video codec ({video_codec}) may need re-encoding")
+                        
+                        if audio_codec in ['aac', 'mp3']:
+                            st.success("✅ Audio codec compatible for streaming")
+                        else:
+                            st.warning(f"⚠️ Audio codec ({audio_codec}) may need re-encoding")
+                        
+                        # Resolution recommendations
+                        width, height = info['video']['width'], info['video']['height']
+                        if width >= 1920 and height >= 1080:
+                            st.info("📺 High resolution - suitable for 1080p streaming")
+                        elif width >= 1280 and height >= 720:
+                            st.info("📺 Good resolution - suitable for 720p streaming")
+                        else:
+                            st.warning("📺 Low resolution - consider upscaling")
                     
                     # Video preview
                     st.subheader("🎥 Video Preview")
-                    st.video(selected_info_video)
+                    st.video(selected_video)
+                    
                 else:
-                    st.error("❌ Could not analyze video file")
+                    st.error("❌ Could not analyze video file. Make sure it's a valid video format.")
         else:
-            st.info("📁 No video files found")
+            st.info("📁 No video files found. Upload videos in the File Manager first.")
 
 def show_stream_control(streamer):
     st.header("🎥 Live Stream Control Center")
@@ -1145,65 +1386,47 @@ def show_stream_control(streamer):
         # Video selection
         st.subheader("📹 Video Selection")
         
-        # Get all video files including merged ones
-        video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.mov', '.avi', '.mkv', '.webm'))]
+        # Get all video files (original + merged)
+        original_videos = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.mov', '.avi', '.mkv', '.webm'))]
         merged_videos = streamer.db.get_merged_videos()
-        merged_video_paths = [video[2] for video in merged_videos if os.path.exists(video[2])]
+        merged_video_paths = [video[4] for video in merged_videos if os.path.exists(video[4])]
         
-        all_videos = video_files + merged_video_paths
+        all_videos = original_videos + [os.path.basename(path) for path in merged_video_paths]
         
         tab1, tab2, tab3 = st.tabs(["📂 All Videos", "🎬 Merged Videos", "⬆️ Upload New"])
         
         with tab1:
             if all_videos:
-                # Check if there's a selected merged video
-                default_video = st.session_state.get('selected_merged_video')
-                if default_video and default_video in all_videos:
-                    default_index = all_videos.index(default_video)
-                else:
-                    default_index = 0
-                
-                selected_video = st.selectbox(
-                    "Select video file:", 
-                    all_videos,
-                    index=default_index
-                )
-                
+                selected_video = st.selectbox("Select video file:", all_videos)
                 if selected_video:
                     file_size = os.path.getsize(selected_video) / (1024*1024)
-                    is_merged = selected_video in merged_video_paths
-                    video_type = "🎬 Merged Video" if is_merged else "📁 Original Video"
-                    st.info(f"{video_type}: {selected_video} ({file_size:.2f} MB)")
                     
-                    # Show video info
-                    video_info = streamer.video_merger.get_video_info(selected_video)
-                    if video_info:
-                        col_info1, col_info2, col_info3 = st.columns(3)
-                        with col_info1:
-                            st.metric("📐 Resolution", f"{video_info['width']}x{video_info['height']}")
-                        with col_info2:
-                            st.metric("⏱️ Duration", f"{video_info['duration']:.1f}s")
-                        with col_info3:
-                            st.metric("📊 FPS", f"{video_info['fps']:.1f}")
+                    # Check if it's a merged video
+                    is_merged = any(os.path.basename(video[4]) == selected_video for video in merged_videos)
+                    if is_merged:
+                        st.info(f"🎬 Merged Video: {selected_video} ({file_size:.2f} MB)")
+                    else:
+                        st.info(f"📁 Original Video: {selected_video} ({file_size:.2f} MB)")
             else:
-                st.warning("No video files found in current directory")
+                st.warning("No video files found")
                 selected_video = None
         
         with tab2:
-            if merged_video_paths:
-                st.write("🎬 Available merged videos:")
-                for merged_video in merged_videos:
-                    if os.path.exists(merged_video[2]):
-                        col_mv1, col_mv2 = st.columns([3, 1])
-                        with col_mv1:
-                            st.write(f"**{merged_video[1]}** - {merged_video[2]}")
-                        with col_mv2:
-                            if st.button(f"📺 Select", key=f"select_merged_{merged_video[0]}"):
-                                st.session_state['selected_merged_video'] = merged_video[2]
-                                st.success(f"Selected {merged_video[1]}!")
-                                st.rerun()
+            if merged_videos:
+                merged_options = {f"{video[1]} ({video[7]})": video[4] for video in merged_videos if os.path.exists(video[4])}
+                
+                if merged_options:
+                    selected_merged = st.selectbox("Select merged video:", list(merged_options.keys()))
+                    if selected_merged:
+                        selected_video = os.path.basename(merged_options[selected_merged])
+                        file_size = os.path.getsize(merged_options[selected_merged]) / (1024*1024)
+                        st.info(f"🎬 Merged Video: {selected_video} ({file_size:.2f} MB)")
+                else:
+                    st.info("No merged videos available")
+                    selected_video = None
             else:
-                st.info("No merged videos available. Create one in the Video Merger.")
+                st.info("No merged videos yet. Create some in the Video Merger!")
+                selected_video = None
         
         with tab3:
             uploaded_file = st.file_uploader(
@@ -1219,6 +1442,12 @@ def show_stream_control(streamer):
                 selected_video = uploaded_file.name
             else:
                 selected_video = st.session_state.get('selected_video')
+        
+        # Quick select from session state
+        if 'selected_merged_video' in st.session_state:
+            selected_video = os.path.basename(st.session_state['selected_merged_video'])
+            st.success(f"🎬 Using merged video: {selected_video}")
+            del st.session_state['selected_merged_video']
         
         # Stream configuration
         st.subheader("⚙️ Stream Configuration")
@@ -1539,12 +1768,11 @@ def show_file_manager(streamer):
                     st.write(f"**Size:** {file_size:.2f} MB")
                     st.write(f"**Modified:** {file_modified.strftime('%Y-%m-%d %H:%M:%S')}")
                     
-                    # Show video info
-                    video_info = streamer.video_merger.get_video_info(video_file)
-                    if video_info:
-                        st.write(f"**Resolution:** {video_info['width']}x{video_info['height']}")
-                        st.write(f"**Duration:** {video_info['duration']:.1f}s")
-                        st.write(f"**FPS:** {video_info['fps']:.1f}")
+                    # Get video info
+                    info = streamer.video_merger.get_video_info(video_file)
+                    if info:
+                        st.write(f"**Duration:** {info['duration']:.2f} seconds")
+                        st.write(f"**Resolution:** {info['video']['width']}x{info['video']['height']}")
                 
                 with col2:
                     if st.button(f"🎥 Preview", key=f"preview_{video_file}"):
@@ -1688,16 +1916,6 @@ def show_settings(streamer):
                 st.error("❌ FFmpeg not found")
         except Exception as e:
             st.error(f"❌ FFmpeg error: {e}")
-        
-        # Check FFprobe
-        try:
-            result = subprocess.run(['ffprobe', '-version'], capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                st.success("✅ FFprobe is installed")
-            else:
-                st.error("❌ FFprobe not found")
-        except Exception as e:
-            st.error(f"❌ FFprobe error: {e}")
     
     with col2:
         # Disk space
